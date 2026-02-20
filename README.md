@@ -264,6 +264,25 @@ Neue relevante Config-Felder:
 - `mtp_window`
 - `max_block_timestamp_step_seconds`
 
+## Mempool Policy (Schritt 8)
+
+- Fee-Rate-basierte Admission/Selektion (`fee / vsize`)
+- Eviction bei vollem Mempool nach niedrigster Package-Fee-Rate
+- Ancestor-/Descendant-Limits gegen unendliche Unconfirmed-Chains
+- Optionales RBF (Ersatz konkurrierender Tx nur mit hoehrem Fee/Fee-Rate)
+- Optionales CPFP-Package-Prioritizing beim Mining
+
+Neue relevante Config-Felder:
+- `max_mempool_virtual_bytes`
+- `min_mempool_fee_rate`
+- `mempool_ancestor_limit`
+- `mempool_descendant_limit`
+- `mempool_rbf_enabled`
+- `mempool_cpfp_enabled`
+- `max_rbf_replacements`
+- `min_rbf_fee_delta`
+- `min_rbf_feerate_delta`
+
 ## Befehle
 
 - `wallet-new --out <file>`

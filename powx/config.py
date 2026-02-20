@@ -23,6 +23,15 @@ class ChainConfig:
     max_adjust_factor_down: float = 0.2
     max_transactions_per_block: int = 500
     max_mempool_transactions: int = 4000
+    max_mempool_virtual_bytes: int = 8_000_000
+    min_mempool_fee_rate: float = 0.0
+    mempool_ancestor_limit: int = 25
+    mempool_descendant_limit: int = 25
+    mempool_rbf_enabled: bool = True
+    mempool_cpfp_enabled: bool = True
+    max_rbf_replacements: int = 100
+    min_rbf_fee_delta: int = 1
+    min_rbf_feerate_delta: float = 0.0
     max_tx_inputs: int = 64
     max_tx_outputs: int = 64
     max_future_block_seconds: int = 2 * 60 * 60

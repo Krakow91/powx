@@ -6,6 +6,7 @@ import math
 import os
 import secrets
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable
 
@@ -195,6 +196,15 @@ class Chain:
                 "max_adjust_factor_down": self._consensus_max_adjust_factor_down,
                 "max_transactions_per_block": self.config.max_transactions_per_block,
                 "max_mempool_transactions": self.config.max_mempool_transactions,
+                "max_mempool_virtual_bytes": self.config.max_mempool_virtual_bytes,
+                "min_mempool_fee_rate": self.config.min_mempool_fee_rate,
+                "mempool_ancestor_limit": self.config.mempool_ancestor_limit,
+                "mempool_descendant_limit": self.config.mempool_descendant_limit,
+                "mempool_rbf_enabled": self.config.mempool_rbf_enabled,
+                "mempool_cpfp_enabled": self.config.mempool_cpfp_enabled,
+                "max_rbf_replacements": self.config.max_rbf_replacements,
+                "min_rbf_fee_delta": self.config.min_rbf_fee_delta,
+                "min_rbf_feerate_delta": self.config.min_rbf_feerate_delta,
                 "max_tx_inputs": self.config.max_tx_inputs,
                 "max_tx_outputs": self.config.max_tx_outputs,
                 "max_future_block_seconds": self.config.max_future_block_seconds,
@@ -999,15 +1009,206 @@ class Chain:
 
         return chain_view, utxo_view
 
+    @staticmethod
+    def _tx_input_outpoint(tx_input: TxInput) -> str:
+        return f"{tx_input.txid}:{tx_input.index}"
+
+    def _tx_virtual_size(self, tx: Transaction) -> int:
+        # Lightweight vsize approximation for fee-rate policy.
+        size = 12
+        for tx_input in tx.inputs:
+            sig_bytes = max(0, len(tx_input.signature) // 2) if tx_input.signature else 0
+            pub_bytes = max(0, len(tx_input.pubkey) // 2) if tx_input.pubkey else 0
+            size += 41 + sig_bytes + pub_bytes
+        for output in tx.outputs:
+            size += 9 + len(output.address.encode("utf-8"))
+        return max(80, size)
+
+    def _collect_ancestors(self, txid: str, parents: dict[str, set[str]]) -> set[str]:
+        visited: set[str] = set()
+        stack = list(parents.get(txid, set()))
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            stack.extend(parents.get(current, set()))
+        return visited
+
+    def _collect_descendants(self, txid: str, children: dict[str, set[str]]) -> set[str]:
+        visited: set[str] = set()
+        stack = list(children.get(txid, set()))
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            stack.extend(children.get(current, set()))
+        return visited
+
+    def _topological_order_subset(
+        self,
+        txids: set[str],
+        parents: dict[str, set[str]],
+    ) -> list[str]:
+        ordered: list[str] = []
+        marked: set[str] = set()
+
+        def visit(current: str) -> None:
+            if current in marked or current not in txids:
+                return
+            marked.add(current)
+            for parent in sorted(parents.get(current, set())):
+                if parent in txids:
+                    visit(parent)
+            ordered.append(current)
+
+        for txid in sorted(txids):
+            visit(txid)
+        return ordered
+
+    def _build_mempool_index(self, txs: list[Transaction]) -> dict[str, Any]:
+        by_txid: dict[str, Transaction] = {tx.txid: tx for tx in txs}
+        parents: dict[str, set[str]] = {txid: set() for txid in by_txid}
+        children: dict[str, set[str]] = {txid: set() for txid in by_txid}
+        spending_index: dict[str, str] = {}
+        fees: dict[str, int] = {}
+        vbytes: dict[str, int] = {}
+        fee_rates: dict[str, float] = {}
+
+        for tx in txs:
+            txid = tx.txid
+            vbytes[txid] = self._tx_virtual_size(tx)
+            total_in = 0
+            valid_inputs = True
+
+            for tx_input in tx.inputs:
+                outpoint = self._tx_input_outpoint(tx_input)
+                existing_spender = spending_index.get(outpoint)
+                if existing_spender and existing_spender != txid:
+                    valid_inputs = False
+                spending_index[outpoint] = txid
+
+                parent = by_txid.get(tx_input.txid)
+                if parent is not None:
+                    if tx_input.index < 0 or tx_input.index >= len(parent.outputs):
+                        valid_inputs = False
+                        continue
+                    parents[txid].add(parent.txid)
+                    total_in += int(parent.outputs[tx_input.index].amount)
+                    continue
+
+                prev = self.utxos.get(outpoint)
+                if prev is None:
+                    valid_inputs = False
+                    continue
+                total_in += int(prev["amount"])
+
+            for parent_txid in parents[txid]:
+                children[parent_txid].add(txid)
+
+            if tx.is_coinbase() or not valid_inputs:
+                fee = 0
+            else:
+                fee = max(0, total_in - sum(out.amount for out in tx.outputs))
+            fees[txid] = fee
+            fee_rates[txid] = fee / max(1, vbytes[txid])
+
+        return {
+            "by_txid": by_txid,
+            "parents": parents,
+            "children": children,
+            "spending_index": spending_index,
+            "fees": fees,
+            "vbytes": vbytes,
+            "fee_rates": fee_rates,
+        }
+
+    def _enforce_chain_limits_for_tx(
+        self,
+        txid: str,
+        parents: dict[str, set[str]],
+        children: dict[str, set[str]],
+    ) -> None:
+        ancestor_limit = max(1, int(self.config.mempool_ancestor_limit))
+        descendant_limit = max(1, int(self.config.mempool_descendant_limit))
+
+        ancestors = self._collect_ancestors(txid, parents)
+        if len(ancestors) > ancestor_limit:
+            raise ValidationError(
+                f"Transaction has too many unconfirmed ancestors (max {ancestor_limit})"
+            )
+
+        to_check = set(ancestors)
+        to_check.add(txid)
+        for item in to_check:
+            descendants = self._collect_descendants(item, children)
+            if len(descendants) > descendant_limit:
+                raise ValidationError(
+                    f"Transaction chain exceeds descendant limit (max {descendant_limit})"
+                )
+
+    def _evict_pool_to_limits(
+        self,
+        txs: list[Transaction],
+        protected_txids: set[str] | None = None,
+    ) -> tuple[list[Transaction], set[str]]:
+        protected = set(protected_txids or set())
+        pool = [Transaction.from_dict(tx.to_dict()) for tx in txs]
+        evicted: set[str] = set()
+
+        while True:
+            index = self._build_mempool_index(pool)
+            total_vbytes = sum(index["vbytes"].values())
+            over_count = len(pool) - int(self.config.max_mempool_transactions)
+            over_vbytes = total_vbytes - int(self.config.max_mempool_virtual_bytes)
+            if over_count <= 0 and over_vbytes <= 0:
+                break
+
+            victim_package: set[str] | None = None
+            victim_rate = 0.0
+            victim_oldest = 0
+
+            for txid, tx in index["by_txid"].items():
+                if txid in protected:
+                    continue
+                descendants = self._collect_descendants(txid, index["children"])
+                package = {txid, *descendants}
+                if package & protected:
+                    continue
+                package_fee = sum(int(index["fees"].get(item, 0)) for item in package)
+                package_vbytes = sum(int(index["vbytes"].get(item, 0)) for item in package)
+                package_rate = package_fee / max(1, package_vbytes)
+                package_oldest = min(index["by_txid"][item].timestamp for item in package)
+
+                if victim_package is None:
+                    victim_package = package
+                    victim_rate = package_rate
+                    victim_oldest = package_oldest
+                    continue
+
+                if package_rate < victim_rate or (
+                    abs(package_rate - victim_rate) <= 1e-12 and package_oldest < victim_oldest
+                ):
+                    victim_package = package
+                    victim_rate = package_rate
+                    victim_oldest = package_oldest
+
+            if not victim_package:
+                break
+
+            evicted.update(victim_package)
+            pool = [tx for tx in pool if tx.txid not in victim_package]
+
+        return pool, evicted
+
     def _sanitize_mempool(self, txs: list[Transaction]) -> list[Transaction]:
-        clean: list[Transaction] = []
+        accepted: list[Transaction] = []
         seen: set[str] = set()
         utxo_view = copy.deepcopy(self.utxos)
         next_block_height = max(0, self.height + 1)
 
         for tx in txs:
-            if len(clean) >= self.config.max_mempool_transactions:
-                break
             if tx.txid in seen:
                 continue
             seen.add(tx.txid)
@@ -1020,11 +1221,58 @@ class Chain:
                 )
                 self._consume_inputs(tx, utxo_view)
                 self._add_outputs(tx, utxo_view)
-                clean.append(tx)
+                accepted.append(tx)
             except ValidationError:
                 continue
 
-        return clean
+        # Drop low fee-rate entries and txs violating ancestor/descendant policy.
+        while True:
+            changed = False
+            index = self._build_mempool_index(accepted)
+            if not index["by_txid"]:
+                break
+
+            min_fee_rate = float(self.config.min_mempool_fee_rate)
+            low_fee = [
+                txid
+                for txid, rate in index["fee_rates"].items()
+                if rate + 1e-12 < min_fee_rate
+            ]
+            if low_fee:
+                for txid in low_fee:
+                    package = {txid, *self._collect_descendants(txid, index["children"])}
+                    accepted = [tx for tx in accepted if tx.txid not in package]
+                changed = True
+                if changed:
+                    continue
+
+            ancestor_limit = max(1, int(self.config.mempool_ancestor_limit))
+            descendant_limit = max(1, int(self.config.mempool_descendant_limit))
+            violating: set[str] = set()
+            for txid in index["by_txid"]:
+                if len(self._collect_ancestors(txid, index["parents"])) > ancestor_limit:
+                    violating.add(txid)
+                if len(self._collect_descendants(txid, index["children"])) > descendant_limit:
+                    violating.add(txid)
+
+            if violating:
+                victim = min(
+                    violating,
+                    key=lambda item: (
+                        float(index["fee_rates"].get(item, 0.0)),
+                        int(index["by_txid"][item].timestamp),
+                    ),
+                )
+                package = {victim, *self._collect_descendants(victim, index["children"])}
+                accepted = [tx for tx in accepted if tx.txid not in package]
+                changed = True
+                if changed:
+                    continue
+
+            break
+
+        accepted, _evicted = self._evict_pool_to_limits(accepted, protected_txids=set())
+        return accepted
 
     @staticmethod
     def _reorg_depth(current: list[Block], candidate: list[Block]) -> int:
@@ -1144,6 +1392,28 @@ class Chain:
         self.mempool = self._sanitize_mempool(self.mempool)
         self.save()
 
+    def _mempool_utxo_view(self, txs: list[Transaction]) -> dict[str, dict[str, Any]]:
+        view = copy.deepcopy(self.utxos)
+        index = self._build_mempool_index(txs)
+        order = self._topological_order_subset(set(index["by_txid"].keys()), index["parents"])
+        for txid in order:
+            tx = index["by_txid"].get(txid)
+            if tx is None:
+                continue
+            self._consume_inputs(tx, view)
+            self._add_outputs(tx, view)
+        return view
+
+    def _tx_fee_rate_for_pool(self, txid: str, index: dict[str, Any]) -> float:
+        fee = int(index["fees"].get(txid, 0))
+        vbytes = int(index["vbytes"].get(txid, 0))
+        return fee / max(1, vbytes)
+
+    def _package_fee_rate(self, txids: set[str], index: dict[str, Any]) -> float:
+        fee = sum(int(index["fees"].get(txid, 0)) for txid in txids)
+        vbytes = sum(int(index["vbytes"].get(txid, 0)) for txid in txids)
+        return fee / max(1, vbytes)
+
     def add_transaction(self, tx: Transaction) -> None:
         if not self.chain:
             raise ValidationError("Initialize the chain first")
@@ -1153,40 +1423,77 @@ class Chain:
         if any(existing.txid == tx.txid for existing in self.mempool):
             raise ValidationError("Transaction already exists in mempool")
 
-        if len(self.mempool) >= self.config.max_mempool_transactions:
-            raise ValidationError(f"Mempool is full (max {self.config.max_mempool_transactions} transactions)")
+        current_pool = [Transaction.from_dict(item.to_dict()) for item in self.mempool]
+        current_index = self._build_mempool_index(current_pool)
 
-        # Build a temporary view that already includes mempool spends to prevent double-spends.
-        utxo_view = copy.deepcopy(self.utxos)
-        for mem_tx in self.mempool:
-            self._consume_inputs(mem_tx, utxo_view)
-            self._add_outputs(mem_tx, utxo_view)
+        candidate_outpoints = {self._tx_input_outpoint(tx_input) for tx_input in tx.inputs}
+        conflicting: set[str] = {
+            spender
+            for outpoint, spender in current_index["spending_index"].items()
+            if outpoint in candidate_outpoints
+        }
 
-        _fee = self.validate_transaction(
+        replacement_set: set[str] = set()
+        if conflicting:
+            if not bool(self.config.mempool_rbf_enabled):
+                raise ValidationError("Conflicting mempool transaction (RBF disabled)")
+            for txid in conflicting:
+                replacement_set.add(txid)
+                replacement_set.update(self._collect_descendants(txid, current_index["children"]))
+            if len(replacement_set) > int(self.config.max_rbf_replacements):
+                raise ValidationError(
+                    f"RBF replacement set too large (max {self.config.max_rbf_replacements})"
+                )
+
+        base_pool = [item for item in current_pool if item.txid not in replacement_set]
+        base_index = self._build_mempool_index(base_pool)
+        utxo_view = self._mempool_utxo_view(base_pool)
+        next_height = max(0, self.height + 1)
+
+        fee = self.validate_transaction(
             tx,
             utxo_view,
             for_mempool=True,
-            block_height=max(0, self.height + 1),
+            block_height=next_height,
         )
-        self._consume_inputs(tx, utxo_view)
-        self._add_outputs(tx, utxo_view)
+        fee_rate = fee / max(1, self._tx_virtual_size(tx))
+        if fee_rate + 1e-12 < float(self.config.min_mempool_fee_rate):
+            raise ValidationError("Transaction feerate is below mempool minimum")
 
-        self.mempool.append(tx)
+        if replacement_set:
+            old_fee = sum(int(current_index["fees"].get(txid, 0)) for txid in replacement_set)
+            old_vbytes = sum(int(current_index["vbytes"].get(txid, 0)) for txid in replacement_set)
+            old_rate = old_fee / max(1, old_vbytes)
+            if fee < old_fee + int(self.config.min_rbf_fee_delta):
+                raise ValidationError("RBF replacement fee delta too small")
+            if fee_rate <= old_rate + float(self.config.min_rbf_feerate_delta):
+                raise ValidationError("RBF replacement feerate too low")
+
+        candidate_pool = base_pool + [tx]
+        candidate_index = self._build_mempool_index(candidate_pool)
+
+        self._enforce_chain_limits_for_tx(
+            tx.txid,
+            candidate_index["parents"],
+            candidate_index["children"],
+        )
+
+        protected = self._collect_ancestors(tx.txid, candidate_index["parents"])
+        protected.add(tx.txid)
+        final_pool, _evicted = self._evict_pool_to_limits(candidate_pool, protected_txids=protected)
+        final_ids = {item.txid for item in final_pool}
+        if tx.txid not in final_ids:
+            raise ValidationError("Mempool full and candidate feerate too low")
+
+        sanitized = self._sanitize_mempool(final_pool)
+        if tx.txid not in {item.txid for item in sanitized}:
+            raise ValidationError("Transaction rejected by mempool policy")
+        self.mempool = sanitized
         self.save()
 
     def _estimate_base_fee(self, tx: Transaction) -> int:
-        # Fee estimate against current UTXO set (without mempool dependencies) for mempool ranking.
-        if tx.is_coinbase():
-            return 0
-        total_in = 0
-        for tx_input in tx.inputs:
-            key = f"{tx_input.txid}:{tx_input.index}"
-            prev = self.utxos.get(key)
-            if prev is None:
-                return 0
-            total_in += int(prev["amount"])
-        total_out = sum(out.amount for out in tx.outputs)
-        return max(0, total_in - total_out)
+        index = self._build_mempool_index([tx])
+        return int(index["fees"].get(tx.txid, 0))
 
     def create_transaction(self, private_key_hex: str, to_address: str, amount: int, fee: int | None = None) -> Transaction:
         if amount <= 0:
@@ -1272,23 +1579,81 @@ class Chain:
         chosen: list[Transaction] = []
         total_fees = 0
         utxo_view = copy.deepcopy(self.utxos)
-        ranked = sorted(
-            self.mempool,
-            key=lambda tx: (self._estimate_base_fee(tx), -tx.timestamp),
-            reverse=True,
-        )
+        max_mempool_tx_in_block = max(0, self.config.max_transactions_per_block - 1)
+        pool_index = self._build_mempool_index(self.mempool)
+        remaining: dict[str, Transaction] = dict(pool_index["by_txid"])
+        parents = pool_index["parents"]
+        children = pool_index["children"]
 
-        for tx in ranked:
-            if len(chosen) >= self.config.max_transactions_per_block - 1:
+        while remaining and len(chosen) < max_mempool_tx_in_block:
+            remaining_ids = set(remaining.keys())
+            best_package: set[str] = set()
+            best_score = -1.0
+            best_fee = -1
+            best_oldest_ts = 0
+
+            for txid, tx in remaining.items():
+                unresolved_ancestors = self._collect_ancestors(txid, parents) & remaining_ids
+                package = set(unresolved_ancestors)
+                package.add(txid)
+
+                if bool(self.config.mempool_cpfp_enabled):
+                    score = self._package_fee_rate(package, pool_index)
+                    package_fee = sum(int(pool_index["fees"].get(item, 0)) for item in package)
+                else:
+                    score = self._tx_fee_rate_for_pool(txid, pool_index)
+                    package = {txid}
+                    package_fee = int(pool_index["fees"].get(txid, 0))
+
+                oldest_ts = min(remaining[item].timestamp for item in package if item in remaining)
+                if (
+                    score > best_score
+                    or (
+                        abs(score - best_score) <= 1e-12
+                        and (package_fee > best_fee or (package_fee == best_fee and oldest_ts < best_oldest_ts))
+                    )
+                ):
+                    best_package = package
+                    best_score = score
+                    best_fee = package_fee
+                    best_oldest_ts = oldest_ts
+
+            if not best_package:
                 break
-            try:
-                fee = self.validate_transaction(tx, utxo_view, for_mempool=True)
-                self._consume_inputs(tx, utxo_view)
-                self._add_outputs(tx, utxo_view)
+
+            ordered = self._topological_order_subset(best_package, parents)
+            admitted_any = False
+            for txid in ordered:
+                if txid not in remaining:
+                    continue
+                if len(chosen) >= max_mempool_tx_in_block:
+                    break
+
+                candidate = remaining[txid]
+                try:
+                    fee = self.validate_transaction(
+                        candidate,
+                        utxo_view,
+                        for_mempool=True,
+                        block_height=prev.index + 1,
+                    )
+                except ValidationError:
+                    reject_set = {txid, *self._collect_descendants(txid, children)}
+                    for rejected in reject_set:
+                        remaining.pop(rejected, None)
+                    continue
+
+                self._consume_inputs(candidate, utxo_view)
+                self._add_outputs(candidate, utxo_view)
                 total_fees += fee
-                chosen.append(tx)
-            except ValidationError:
-                continue
+                chosen.append(candidate)
+                remaining.pop(txid, None)
+                admitted_any = True
+
+            if not admitted_any:
+                # Defensive progress guard.
+                for txid in ordered:
+                    remaining.pop(txid, None)
 
         issued_before = self.issued_supply()
         remaining = max(0, self.config.max_total_supply - issued_before)
@@ -1363,6 +1728,18 @@ class Chain:
             "max_total_supply": self.config.max_total_supply,
             "remaining_supply": max(0, self.config.max_total_supply - issued),
             "mempool_size": len(self.mempool),
+            "mempool_policy": {
+                "max_transactions": self.config.max_mempool_transactions,
+                "max_virtual_bytes": self.config.max_mempool_virtual_bytes,
+                "min_fee_rate": self.config.min_mempool_fee_rate,
+                "ancestor_limit": self.config.mempool_ancestor_limit,
+                "descendant_limit": self.config.mempool_descendant_limit,
+                "rbf_enabled": self.config.mempool_rbf_enabled,
+                "cpfp_enabled": self.config.mempool_cpfp_enabled,
+                "max_rbf_replacements": self.config.max_rbf_replacements,
+                "min_rbf_fee_delta": self.config.min_rbf_fee_delta,
+                "min_rbf_feerate_delta": self.config.min_rbf_feerate_delta,
+            },
             "utxo_count": len(self.utxos),
             "target": tip.target if tip else None,
         }
