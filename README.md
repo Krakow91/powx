@@ -248,6 +248,22 @@ python powx_cli.py api-mine --node http://127.0.0.1:8844 --wallet alice.json --b
 # oder ohne Limit (Standard): --timeout 0
 ```
 
+## Difficulty + Time Hardening (Schritt 7)
+
+- Standard-Schedule fuer neue Chains: `asert-v3` (stabileres exponentielles Retargeting)
+- Legacy/Window-Chains bleiben kompatibel (`legacy-v1`, `window-v2` werden beim Laden weiter erkannt)
+- Strengere Timestamp-Regeln:
+- `timestamp > Median-Time-Past` (bei `asert-v3` mit groesserem MTP-Fenster)
+- Keine Zeit-Rueckspruenge (`timestamp` darf nicht kleiner als der Parent-Timestamp sein)
+- Klare DoS-Grenze fuer Zeit-Spruenge pro Block (`max_block_timestamp_step_seconds`)
+- Harte Future-Grenze bleibt aktiv (`max_future_block_seconds`)
+
+Neue relevante Config-Felder:
+- `target_schedule` (z.B. `asert-v3`)
+- `asert_half_life`
+- `mtp_window`
+- `max_block_timestamp_step_seconds`
+
 ## Befehle
 
 - `wallet-new --out <file>`
@@ -283,7 +299,7 @@ python powx_cli.py api-mine --node http://127.0.0.1:8844 --wallet alice.json --b
 - Standard fuer `init` ist `--genesis-supply 0` (kein Premine). Wenn du einen Premine setzt, wird der Rest fuer Mining entsprechend kleiner.
 - Schritt 1 umgesetzt: Upgrade-Framework mit `protocol_version` und `protocol_upgrade_v2_height` (Status zeigt aktive/naechste Protokollversion).
 - Neue Blöcke mit zu weit in der Zukunft liegenden Timestamps werden abgelehnt (`max_future_block_seconds`).
-- Difficulty passt sich über ein Fenster (`difficulty_window`) an, nicht nur über den letzten Einzelblock (stabilere Anpassung).
+- Difficulty ist standardmaessig auf ASERT (`asert-v3`) umgestellt; `window-v2` wird fuer bestehende Chains weiterhin unterstuetzt.
 - Difficulty/PoW-Parameter sind lokal auf praktikables Mining eingestellt.
 - Wenn Mining zu schnell ist, nutze einen neuen Data-Ordner (`--data-dir`), damit die aktuelle Difficulty-Konfiguration greift.
 - Sehr schnelles Mining ist in einem lokalen Testnetz normal und beabsichtigt; es ist kein Mainnet-Difficulty-Profil.

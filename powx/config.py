@@ -7,8 +7,11 @@ class ChainConfig:
     chain_id: str = "kk91-gpu-main"
     protocol_version: int = 1
     protocol_upgrade_v2_height: int = 2_147_483_647
+    target_schedule: str = "asert-v3"
     target_block_time: int = 30
     difficulty_window: int = 30
+    asert_half_life: int = 30 * 60
+    mtp_window: int = 17
     halving_interval: int = 210_000
     initial_block_reward: int = 50
     max_total_supply: int = 911_000_000
@@ -23,6 +26,7 @@ class ChainConfig:
     max_tx_inputs: int = 64
     max_tx_outputs: int = 64
     max_future_block_seconds: int = 2 * 60 * 60
+    max_block_timestamp_step_seconds: int = 24 * 60 * 60
     max_mempool_tx_age_seconds: int = 48 * 60 * 60
     max_future_tx_seconds: int = 2 * 60
     max_reorg_depth: int = 12

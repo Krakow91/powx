@@ -2,6 +2,7 @@
 
 import copy
 import json
+import math
 import os
 import secrets
 import time
@@ -39,6 +40,7 @@ class Chain:
         self.utxos: dict[str, dict[str, Any]] = {}
         self.mempool: list[Transaction] = []
         self._legacy_target_schedule = False
+        self._asert_target_schedule = False
         self._consensus_chain_id = self.config.chain_id
         self._consensus_protocol_version = self.config.protocol_version
         self._consensus_protocol_upgrade_v2_height = self.config.protocol_upgrade_v2_height
@@ -46,12 +48,79 @@ class Chain:
         self._consensus_max_target = self.config.max_target
         self._consensus_max_adjust_factor_up = self.config.max_adjust_factor_up
         self._consensus_max_adjust_factor_down = self.config.max_adjust_factor_down
+        self._consensus_asert_half_life = self.config.asert_half_life
+        self._consensus_mtp_window = self.config.mtp_window
+        self._consensus_max_block_timestamp_step_seconds = self.config.max_block_timestamp_step_seconds
         self._gpu_miner: OpenCLMiner | None = None
         self._gpu_probe_attempted = False
 
     @staticmethod
     def _now() -> int:
         return int(time.time())
+
+    @staticmethod
+    def _normalize_target_schedule_name(raw: Any) -> str:
+        schedule = str(raw).strip().lower()
+        if schedule in {"legacy", "legacy-v1", "v1"}:
+            return "legacy-v1"
+        if schedule in {"window", "window-v2", "v2"}:
+            return "window-v2"
+        if schedule in {"asert", "asert-v3", "v3"}:
+            return "asert-v3"
+        return ""
+
+    @classmethod
+    def _detect_target_schedule(cls, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return "window-v2"
+
+        normalized = cls._normalize_target_schedule_name(raw.get("target_schedule", ""))
+        if normalized:
+            return normalized
+
+        if "difficulty_window" not in raw:
+            return "legacy-v1"
+        try:
+            window = int(raw.get("difficulty_window"))
+        except (TypeError, ValueError):
+            return "window-v2"
+        return "legacy-v1" if window <= 2 else "window-v2"
+
+    @staticmethod
+    def _is_legacy_schedule_name(name: str) -> bool:
+        return name == "legacy-v1"
+
+    @staticmethod
+    def _is_asert_schedule_name(name: str) -> bool:
+        return name == "asert-v3"
+
+    def _set_target_schedule_name(self, name: str) -> None:
+        normalized = self._normalize_target_schedule_name(name)
+        if not normalized:
+            normalized = "window-v2"
+        self._legacy_target_schedule = self._is_legacy_schedule_name(normalized)
+        self._asert_target_schedule = self._is_asert_schedule_name(normalized)
+
+    def _target_schedule_name(self) -> str:
+        if self._legacy_target_schedule:
+            return "legacy-v1"
+        if self._asert_target_schedule:
+            return "asert-v3"
+        return "window-v2"
+
+    def _resolve_target_schedule_name(self, name: str | None = None) -> str:
+        if name is None:
+            return self._target_schedule_name()
+        normalized = self._normalize_target_schedule_name(name)
+        if normalized:
+            return normalized
+        return self._target_schedule_name()
+
+    def _mtp_window_for_schedule(self, target_schedule: str | None = None) -> int:
+        schedule_name = self._resolve_target_schedule_name(target_schedule)
+        if self._is_asert_schedule_name(schedule_name):
+            return max(11, int(self._consensus_mtp_window))
+        return 11
 
     def exists(self) -> bool:
         return self.state_path.exists()
@@ -65,20 +134,20 @@ class Chain:
 
         self._reset_consensus_overrides()
         raw_config = data.get("config")
-        legacy_target_schedule = self._detect_legacy_target_schedule(raw_config)
-        self._validate_state_config(raw_config, legacy_target_schedule=legacy_target_schedule)
-        self._apply_state_consensus_overrides(raw_config, legacy_target_schedule=legacy_target_schedule)
+        target_schedule = self._detect_target_schedule(raw_config)
+        self._validate_state_config(raw_config, target_schedule=target_schedule)
+        self._apply_state_consensus_overrides(raw_config, target_schedule=target_schedule)
 
         loaded_chain = [Block.from_dict(item) for item in data.get("chain", [])]
         if loaded_chain:
             try:
                 self.chain, self.utxos = self.validate_chain_blocks(
                     loaded_chain,
-                    legacy_target_schedule=legacy_target_schedule,
+                    target_schedule=target_schedule,
                 )
             except ValidationError as exc:
                 if (
-                    legacy_target_schedule
+                    self._is_legacy_schedule_name(target_schedule)
                     and self._legacy_missing_down_adjust(raw_config)
                     and "target mismatch" in str(exc).lower()
                     and self._consensus_max_adjust_factor_down != 0.5
@@ -87,22 +156,22 @@ class Chain:
                     self._consensus_max_adjust_factor_down = 0.5
                     self.chain, self.utxos = self.validate_chain_blocks(
                         loaded_chain,
-                        legacy_target_schedule=legacy_target_schedule,
+                        target_schedule=target_schedule,
                     )
                 else:
                     raise
-            self._legacy_target_schedule = legacy_target_schedule
+            self._set_target_schedule_name(target_schedule)
         else:
             self.chain = []
             self.utxos = {}
-            self._legacy_target_schedule = legacy_target_schedule
+            self._set_target_schedule_name(target_schedule)
 
         self.mempool = [Transaction.from_dict(item) for item in data.get("mempool", [])]
         self.mempool = self._sanitize_mempool(self.mempool)
 
     def save(self) -> None:
-        target_schedule = "legacy-v1" if self._legacy_target_schedule else "window-v2"
-        difficulty_window = 2 if self._legacy_target_schedule else self.config.difficulty_window
+        target_schedule = self._target_schedule_name()
+        difficulty_window = 2 if self._is_legacy_schedule_name(target_schedule) else self.config.difficulty_window
         initial_target = self.chain[0].target if self.chain else self.config.initial_target
         data = {
             "config": {
@@ -113,6 +182,8 @@ class Chain:
                 "target_schedule": target_schedule,
                 "target_block_time": self._consensus_target_block_time,
                 "difficulty_window": difficulty_window,
+                "asert_half_life": self._consensus_asert_half_life,
+                "mtp_window": self._consensus_mtp_window,
                 "pow_algorithm": self.config.pow_algorithm,
                 "halving_interval": self.config.halving_interval,
                 "initial_block_reward": self.config.initial_block_reward,
@@ -127,6 +198,7 @@ class Chain:
                 "max_tx_inputs": self.config.max_tx_inputs,
                 "max_tx_outputs": self.config.max_tx_outputs,
                 "max_future_block_seconds": self.config.max_future_block_seconds,
+                "max_block_timestamp_step_seconds": self._consensus_max_block_timestamp_step_seconds,
                 "max_mempool_tx_age_seconds": self.config.max_mempool_tx_age_seconds,
                 "max_future_tx_seconds": self.config.max_future_tx_seconds,
                 "max_reorg_depth": self.config.max_reorg_depth,
@@ -145,22 +217,7 @@ class Chain:
 
     @staticmethod
     def _detect_legacy_target_schedule(raw: Any) -> bool:
-        if not isinstance(raw, dict):
-            return False
-
-        schedule = str(raw.get("target_schedule", "")).strip().lower()
-        if schedule in {"legacy", "legacy-v1", "v1"}:
-            return True
-        if schedule in {"window", "window-v2", "v2"}:
-            return False
-
-        if "difficulty_window" not in raw:
-            return True
-        try:
-            window = int(raw.get("difficulty_window"))
-        except (TypeError, ValueError):
-            return False
-        return window <= 2
+        return Chain._is_legacy_schedule_name(Chain._detect_target_schedule(raw))
 
     @staticmethod
     def _legacy_missing_down_adjust(raw: Any) -> bool:
@@ -175,6 +232,8 @@ class Chain:
         return allowed
 
     def _reset_consensus_overrides(self) -> None:
+        configured_schedule = self._normalize_target_schedule_name(self.config.target_schedule)
+        self._set_target_schedule_name(configured_schedule or "asert-v3")
         self._consensus_chain_id = str(self.config.chain_id)
         self._consensus_protocol_version = int(self.config.protocol_version)
         self._consensus_protocol_upgrade_v2_height = int(self.config.protocol_upgrade_v2_height)
@@ -182,10 +241,18 @@ class Chain:
         self._consensus_max_target = int(self.config.max_target)
         self._consensus_max_adjust_factor_up = float(self.config.max_adjust_factor_up)
         self._consensus_max_adjust_factor_down = float(self.config.max_adjust_factor_down)
+        self._consensus_asert_half_life = max(60, int(self.config.asert_half_life))
+        self._consensus_mtp_window = max(11, int(self.config.mtp_window))
+        self._consensus_max_block_timestamp_step_seconds = max(
+            self._consensus_target_block_time * 2,
+            int(self.config.max_block_timestamp_step_seconds),
+        )
 
-    def _apply_state_consensus_overrides(self, raw: Any, legacy_target_schedule: bool) -> None:
+    def _apply_state_consensus_overrides(self, raw: Any, target_schedule: str) -> None:
         if not isinstance(raw, dict):
             return
+
+        self._set_target_schedule_name(target_schedule)
 
         if "chain_id" in raw:
             chain_id = str(raw.get("chain_id", "")).strip()
@@ -246,7 +313,34 @@ class Chain:
             except (TypeError, ValueError) as exc:
                 raise ValidationError("Invalid config value for 'max_adjust_factor_down' in state file") from exc
 
-    def _validate_state_config(self, raw: Any, legacy_target_schedule: bool) -> None:
+        if "asert_half_life" in raw:
+            try:
+                parsed = int(raw.get("asert_half_life"))
+                if parsed < 60:
+                    raise ValueError
+                self._consensus_asert_half_life = parsed
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("Invalid config value for 'asert_half_life' in state file") from exc
+
+        if "mtp_window" in raw:
+            try:
+                parsed = int(raw.get("mtp_window"))
+                if parsed < 11:
+                    raise ValueError
+                self._consensus_mtp_window = parsed
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("Invalid config value for 'mtp_window' in state file") from exc
+
+        if "max_block_timestamp_step_seconds" in raw:
+            try:
+                parsed = int(raw.get("max_block_timestamp_step_seconds"))
+                if parsed < max(2, self._consensus_target_block_time):
+                    raise ValueError
+                self._consensus_max_block_timestamp_step_seconds = parsed
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("Invalid config value for 'max_block_timestamp_step_seconds' in state file") from exc
+
+    def _validate_state_config(self, raw: Any, target_schedule: str) -> None:
         if not isinstance(raw, dict):
             return
 
@@ -281,7 +375,12 @@ class Chain:
                     f"State config mismatch for 'chain_id': file={chain_id} runtime={self.config.chain_id}"
                 )
 
-        if not legacy_target_schedule and "difficulty_window" in raw:
+        if "target_schedule" in raw:
+            normalized = self._normalize_target_schedule_name(raw.get("target_schedule", ""))
+            if not normalized:
+                raise ValidationError("Invalid config value for 'target_schedule' in state file")
+
+        if self._resolve_target_schedule_name(target_schedule) == "window-v2" and "difficulty_window" in raw:
             try:
                 window = int(raw.get("difficulty_window"))
             except (TypeError, ValueError) as exc:
@@ -319,7 +418,6 @@ class Chain:
                 f"Genesis supply exceeds max_total_supply ({self.config.max_total_supply})"
             )
         self._validate_address_format(genesis_address)
-        self._legacy_target_schedule = False
         self._reset_consensus_overrides()
 
         timestamp = self._now()
@@ -489,37 +587,69 @@ class Chain:
         self,
         history: list[Block],
         timestamp: int,
-        legacy_target_schedule: bool | None = None,
+        target_schedule: str | None = None,
     ) -> int:
         if not history:
             return self.config.initial_target
 
         prev = history[-1]
-        use_legacy = self._legacy_target_schedule if legacy_target_schedule is None else bool(legacy_target_schedule)
-        if use_legacy:
-            lookback = 1
-        else:
-            window = max(2, int(self.config.difficulty_window))
-            lookback = min(len(history), window - 1)
-        anchor = history[-lookback]
+        schedule_name = self._resolve_target_schedule_name(target_schedule)
 
-        expected_span = max(1, self._consensus_target_block_time * lookback)
-        actual_span = max(1, timestamp - anchor.timestamp)
-        ratio = actual_span / expected_span
+        if self._is_asert_schedule_name(schedule_name):
+            max_step = max(
+                self._consensus_target_block_time * 2,
+                int(self._consensus_max_block_timestamp_step_seconds),
+            )
+            delta = int(timestamp) - int(prev.timestamp)
+            bounded_delta = max(-max_step, min(max_step, delta))
+            exponent = (bounded_delta - self._consensus_target_block_time) / float(
+                max(60, self._consensus_asert_half_life)
+            )
+            ratio = math.exp2(exponent)
+        else:
+            if self._is_legacy_schedule_name(schedule_name):
+                lookback = 1
+            else:
+                window = max(2, int(self.config.difficulty_window))
+                lookback = min(len(history), window - 1)
+            anchor = history[-lookback]
+
+            expected_span = max(1, self._consensus_target_block_time * lookback)
+            actual_span = max(1, timestamp - anchor.timestamp)
+            ratio = actual_span / expected_span
 
         ratio = min(self._consensus_max_adjust_factor_up, ratio)
         ratio = max(self._consensus_max_adjust_factor_down, ratio)
-
         target = int(prev.target * ratio)
         target = max(1, target)
         target = min(self._consensus_max_target, target)
         return target
 
-    def _validate_block_timestamp(self, timestamp: int, median_past: int, context: str) -> None:
+    def _validate_block_timestamp(
+        self,
+        timestamp: int,
+        median_past: int,
+        context: str,
+        prev_timestamp: int | None = None,
+    ) -> None:
+        now_ts = self._now()
+
         if timestamp <= median_past:
             raise ValidationError(f"{context} timestamp is too old")
 
-        max_allowed = self._now() + self.config.max_future_block_seconds
+        if prev_timestamp is not None:
+            if timestamp < prev_timestamp:
+                raise ValidationError(f"{context} timestamp regresses")
+            max_step = max(
+                self._consensus_target_block_time * 2,
+                int(self._consensus_max_block_timestamp_step_seconds),
+            )
+            step = timestamp - prev_timestamp
+            # Enforce per-block jump bounds only while tip-time is still near local wall-clock.
+            if step > max_step and (now_ts - prev_timestamp) <= max_step:
+                raise ValidationError(f"{context} timestamp jump is too large")
+
+        max_allowed = now_ts + self.config.max_future_block_seconds
         if timestamp > max_allowed:
             raise ValidationError(f"{context} timestamp is too far in the future")
 
@@ -527,7 +657,7 @@ class Chain:
         return self._next_target_from_history(
             self.chain,
             timestamp,
-            legacy_target_schedule=self._legacy_target_schedule,
+            target_schedule=self._target_schedule_name(),
         )
 
     def block_reward(self, height: int) -> int:
@@ -751,12 +881,12 @@ class Chain:
         self,
         chain: list[Block],
         timestamp: int,
-        legacy_target_schedule: bool | None = None,
+        target_schedule: str | None = None,
     ) -> int:
         return self._next_target_from_history(
             chain,
             timestamp,
-            legacy_target_schedule=legacy_target_schedule,
+            target_schedule=target_schedule,
         )
 
     def _validate_genesis_block(self, genesis: Block) -> dict[str, dict[str, Any]]:
@@ -802,12 +932,13 @@ class Chain:
     def validate_chain_blocks(
         self,
         blocks: list[Block],
-        legacy_target_schedule: bool | None = None,
+        target_schedule: str | None = None,
     ) -> tuple[list[Block], dict[str, dict[str, Any]]]:
         if not blocks:
             raise ValidationError("Candidate chain is empty")
 
-        use_legacy = self._legacy_target_schedule if legacy_target_schedule is None else bool(legacy_target_schedule)
+        schedule_name = self._resolve_target_schedule_name(target_schedule)
+        mtp_window = self._mtp_window_for_schedule(schedule_name)
         normalized = [Block.from_dict(block.to_dict()) for block in blocks]
 
         chain_view: list[Block] = [normalized[0]]
@@ -825,14 +956,15 @@ class Chain:
                 raise ValidationError("Wrong previous block hash in candidate chain")
             self._validate_block_timestamp(
                 block.timestamp,
-                self._median_time_for_chain(chain_view),
+                self._median_time_for_chain(chain_view, count=mtp_window),
                 context="Candidate block",
+                prev_timestamp=prev.timestamp,
             )
 
             expected_target = self._next_target_for_chain(
                 chain_view,
                 block.timestamp,
-                legacy_target_schedule=use_legacy,
+                target_schedule=schedule_name,
             )
             if block.target != expected_target:
                 raise ValidationError("Candidate block target mismatch")
@@ -960,7 +1092,13 @@ class Chain:
             raise ValidationError("Wrong block index")
         if block.prev_hash != prev.block_hash:
             raise ValidationError("Wrong previous block hash")
-        self._validate_block_timestamp(block.timestamp, self.median_time_past(), context="Block")
+        mtp_window = self._mtp_window_for_schedule()
+        self._validate_block_timestamp(
+            block.timestamp,
+            self.median_time_past(count=mtp_window),
+            context="Block",
+            prev_timestamp=prev.timestamp,
+        )
 
         expected_target = self.next_target(block.timestamp)
         if block.target != expected_target:
@@ -1124,9 +1262,10 @@ class Chain:
             raise ValidationError("Initialize the chain first")
         self._validate_address_format(miner_address)
 
-        timestamp = max(self._now(), self.median_time_past() + 1)
-        target = self.next_target(timestamp)
         prev = self.chain[-1]
+        mtp_window = self._mtp_window_for_schedule()
+        timestamp = max(self._now(), self.median_time_past(count=mtp_window) + 1, prev.timestamp)
+        target = self.next_target(timestamp)
 
         self.prune_mempool(save=False)
 
@@ -1213,7 +1352,10 @@ class Chain:
             "next_protocol_version": next_protocol,
             "protocol_upgrade_v2_height": upgrade_height,
             "blocks_until_protocol_v2": blocks_until_upgrade,
-            "target_schedule": "legacy-v1" if self._legacy_target_schedule else "window-v2",
+            "target_schedule": self._target_schedule_name(),
+            "asert_half_life": self._consensus_asert_half_life,
+            "mtp_window": self._mtp_window_for_schedule(),
+            "max_block_timestamp_step_seconds": self._consensus_max_block_timestamp_step_seconds,
             "height": self.height,
             "tip_hash": tip.block_hash if tip else None,
             "chain_work": int(tip.chain_work) if tip else 0,
