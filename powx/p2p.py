@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -204,6 +205,13 @@ class P2PNode:
         peer_reward_success: int = 3,
         peer_auth_max_skew_seconds: int = 120,
         peer_auth_replay_window_seconds: int = 180,
+        max_inv_items: int = 256,
+        max_getdata_items: int = 128,
+        max_orphan_blocks: int = 2048,
+        orphan_ttl_seconds: int = 1800,
+        max_outbound_broadcast_peers: int = 16,
+        max_outbound_sync_peers: int = 32,
+        max_outbound_peers_per_bucket: int = 2,
     ) -> None:
         self.chain = Chain(data_dir)
         self.chain_lock = threading.RLock()
@@ -231,6 +239,13 @@ class P2PNode:
             self.peer_auth_max_skew_seconds,
             int(peer_auth_replay_window_seconds),
         )
+        self.max_inv_items = max(16, int(max_inv_items))
+        self.max_getdata_items = max(8, int(max_getdata_items))
+        self.max_orphan_blocks = max(16, int(max_orphan_blocks))
+        self.orphan_ttl_seconds = max(60, int(orphan_ttl_seconds))
+        self.max_outbound_broadcast_peers = max(1, int(max_outbound_broadcast_peers))
+        self.max_outbound_sync_peers = max(1, int(max_outbound_sync_peers))
+        self.max_outbound_peers_per_bucket = max(1, int(max_outbound_peers_per_bucket))
         self.stop_event = threading.Event()
         self._sync_thread: threading.Thread | None = None
         self._rate_limit_lock = threading.Lock()
@@ -252,6 +267,9 @@ class P2PNode:
         self._seen_tx_order: deque[str] = deque()
         self._seen_block_hashes: set[str] = set()
         self._seen_block_order: deque[str] = deque()
+        self._orphan_blocks: dict[str, Block] = {}
+        self._orphans_by_prev: dict[str, set[str]] = defaultdict(set)
+        self._orphan_received_at: dict[str, float] = {}
         self._client_hits: dict[str, deque[float]] = defaultdict(deque)
         self._sync_retry_last: dict[tuple[str, str], float] = {}
         self._peer_scores: dict[str, int] = {}
@@ -477,6 +495,21 @@ class P2PNode:
                         self._send_json(status, result)
                         return
 
+                    if path == "/inv":
+                        items = payload.get("items", [])
+                        ttl = node._coerce_ttl(payload.get("ttl", 2), field_name="ttl")
+                        sender = str(payload.get("from", "")).strip()
+                        result = node.accept_inventory(items, sender=sender, ttl=ttl)
+                        status = 200 if result.get("ok") else 400
+                        self._send_json(status, result)
+                        return
+
+                    if path == "/getdata":
+                        items = payload.get("items", [])
+                        ttl = node._coerce_ttl(payload.get("ttl", 2), field_name="ttl")
+                        self._send_json(200, node.getdata_payload(items, ttl=ttl))
+                        return
+
                     if path == "/sync":
                         peer = str(payload.get("peer", "")).strip()
                         if peer:
@@ -678,12 +711,75 @@ class P2PNode:
             self._save_peer_security()
         return is_banned
 
-    def _get_relay_peers(self) -> list[str]:
+    @staticmethod
+    def _peer_diversity_bucket(peer_url: str) -> str:
+        parsed = urlparse(peer_url)
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            return "unknown"
+
+        try:
+            ip_obj = ipaddress.ip_address(host)
+        except ValueError:
+            labels = [label for label in host.split(".") if label]
+            if len(labels) >= 2:
+                return f"dns:{labels[-2]}.{labels[-1]}"
+            return f"dns:{host}"
+
+        if ip_obj.version == 4:
+            octets = host.split(".")
+            if len(octets) >= 2:
+                return f"ipv4:{octets[0]}.{octets[1]}"
+            return f"ipv4:{host}"
+
+        hextets = ip_obj.exploded.split(":")
+        return f"ipv6:{':'.join(hextets[:3])}"
+
+    def _select_diverse_peers(self, peers: list[str], limit: int) -> list[str]:
+        if limit <= 0 or not peers:
+            return []
+
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for peer in peers:
+            grouped[self._peer_diversity_bucket(peer)].append(peer)
+
+        with self._peer_security_lock:
+            for bucket in grouped.values():
+                bucket.sort(key=lambda value: (int(self._peer_scores.get(value, 0)), value))
+
+        buckets = sorted(grouped.keys())
+        selected: list[str] = []
+        picked_per_bucket: dict[str, int] = defaultdict(int)
+
+        while len(selected) < limit:
+            progressed = False
+            for bucket in buckets:
+                picked = picked_per_bucket[bucket]
+                if picked >= self.max_outbound_peers_per_bucket:
+                    continue
+                candidates = grouped[bucket]
+                if picked >= len(candidates):
+                    continue
+                selected.append(candidates[picked])
+                picked_per_bucket[bucket] += 1
+                progressed = True
+                if len(selected) >= limit:
+                    break
+            if not progressed:
+                break
+
+        return selected
+
+    def _get_relay_peers(self, limit: int | None = None) -> list[str]:
         peers: list[str] = []
         for peer in self.get_peers():
             if not self._is_peer_banned(peer):
                 peers.append(peer)
-        return peers
+        if not peers:
+            return []
+        wanted = self.max_outbound_broadcast_peers if limit is None else max(1, int(limit))
+        wanted = min(wanted, len(peers))
+        return self._select_diverse_peers(peers, limit=wanted)
 
     def _penalize_peer(self, peer_url: str, points: int, reason: str) -> None:
         if not peer_url or not self._is_known_peer(peer_url):
@@ -1026,10 +1122,12 @@ class P2PNode:
     def _prime_seen_from_chain_unlocked(self) -> None:
         for block in self.chain.chain:
             self._remember_block_hash(block.block_hash)
+            self._drop_orphan_unlocked(block.block_hash)
             for tx in block.transactions:
                 self._remember_txid(tx.txid)
         for tx in self.chain.mempool:
             self._remember_txid(tx.txid)
+        self._prune_orphans_unlocked()
 
     def _load_peers(self) -> None:
         if not self.peers_path.exists():
@@ -1092,9 +1190,12 @@ class P2PNode:
     def status_payload(self) -> dict[str, Any]:
         with self.chain_lock:
             self._refresh_chain_from_disk_unlocked()
+            self._prune_orphans_unlocked()
             status = self.chain.status()
             tip = self.chain.tip
             work = int(tip.chain_work) if tip else 0
+            orphan_count = len(self._orphan_blocks)
+            orphan_parent_count = len(self._orphans_by_prev)
         return {
             "ok": True,
             "node": self.node_url,
@@ -1114,10 +1215,24 @@ class P2PNode:
                 "peer_ban_seconds": self.peer_ban_seconds,
                 "peer_auth_max_skew_seconds": self.peer_auth_max_skew_seconds,
                 "peer_auth_replay_window_seconds": self.peer_auth_replay_window_seconds,
+                "max_inv_items": self.max_inv_items,
+                "max_getdata_items": self.max_getdata_items,
+                "max_orphan_blocks": self.max_orphan_blocks,
+                "orphan_ttl_seconds": self.orphan_ttl_seconds,
+                "max_outbound_broadcast_peers": self.max_outbound_broadcast_peers,
+                "max_outbound_sync_peers": self.max_outbound_sync_peers,
+                "max_outbound_peers_per_bucket": self.max_outbound_peers_per_bucket,
             },
             "peer_security": self._peer_security_payload(),
             "status": status,
             "chain_work": work,
+            "orphans": {
+                "count": orphan_count,
+                "parent_keys": orphan_parent_count,
+            },
+            "protocols": {
+                "inventory_relay": "inv/getdata",
+            },
         }
 
     def balance_payload(self, address: str) -> dict[str, Any]:
@@ -1365,15 +1480,413 @@ class P2PNode:
         except ValueError:
             return ""
 
+    def _normalize_inventory_items(self, items_raw: Any, limit: int) -> list[dict[str, str]]:
+        if not isinstance(items_raw, list):
+            raise ValidationError("items must be a list")
+
+        normalized: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        max_items = max(1, int(limit))
+        for raw in items_raw:
+            if len(normalized) >= max_items:
+                break
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("type", "")).strip().lower()
+            object_id = str(raw.get("id", "")).strip().lower()
+            if kind not in {"tx", "block"}:
+                continue
+            if not self._is_hex_string(object_id, 64):
+                continue
+            key = (kind, object_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({"type": kind, "id": object_id})
+        return normalized
+
+    def _chain_has_block_hash_unlocked(self, block_hash: str) -> bool:
+        if not block_hash:
+            return False
+        if block_hash in self._orphan_blocks:
+            return True
+        return any(block.block_hash == block_hash for block in self.chain.chain)
+
+    def _has_txid_unlocked(self, txid: str) -> bool:
+        if txid in self._seen_txids:
+            return True
+        return any(tx.txid == txid for tx in self.chain.mempool)
+
+    def _drop_orphan_unlocked(self, block_hash: str) -> bool:
+        block = self._orphan_blocks.pop(block_hash, None)
+        self._orphan_received_at.pop(block_hash, None)
+        if block is None:
+            return False
+
+        siblings = self._orphans_by_prev.get(block.prev_hash)
+        if siblings is not None:
+            siblings.discard(block_hash)
+            if not siblings:
+                self._orphans_by_prev.pop(block.prev_hash, None)
+        return True
+
+    def _prune_orphans_unlocked(self) -> int:
+        removed = 0
+        now = time.time()
+        stale_before = now - float(self.orphan_ttl_seconds)
+
+        stale_hashes = [block_hash for block_hash, ts in self._orphan_received_at.items() if ts < stale_before]
+        for block_hash in stale_hashes:
+            if self._drop_orphan_unlocked(block_hash):
+                removed += 1
+
+        if len(self._orphan_blocks) > self.max_orphan_blocks:
+            overflow = len(self._orphan_blocks) - self.max_orphan_blocks
+            oldest = sorted(self._orphan_received_at.items(), key=lambda item: item[1])[:overflow]
+            for block_hash, _ts in oldest:
+                if self._drop_orphan_unlocked(block_hash):
+                    removed += 1
+
+        return removed
+
+    def _store_orphan_unlocked(self, block: Block) -> str:
+        if block.block_hash in self._orphan_blocks:
+            return "orphan-known"
+        if self._chain_has_block_hash_unlocked(block.block_hash):
+            return "known"
+
+        self._prune_orphans_unlocked()
+        if len(self._orphan_blocks) >= self.max_orphan_blocks:
+            oldest = sorted(self._orphan_received_at.items(), key=lambda item: item[1])[:1]
+            for block_hash, _ts in oldest:
+                self._drop_orphan_unlocked(block_hash)
+
+        self._orphan_blocks[block.block_hash] = Block.from_dict(block.to_dict())
+        self._orphan_received_at[block.block_hash] = time.time()
+        self._orphans_by_prev[block.prev_hash].add(block.block_hash)
+        return "orphan-stored"
+
+    def _collect_orphan_children_unlocked(self, parent_hash: str) -> list[Block]:
+        child_hashes = sorted(self._orphans_by_prev.get(parent_hash, set()))
+        if not child_hashes:
+            return []
+
+        children: list[Block] = []
+        for child_hash in child_hashes:
+            child_block = self._orphan_blocks.get(child_hash)
+            if child_block is not None:
+                children.append(child_block)
+            self._drop_orphan_unlocked(child_hash)
+
+        children.sort(key=lambda block: (block.index, block.block_hash))
+        return children
+
+    def _drain_orphans_after_parent(self, parent_hash: str, ttl: int) -> int:
+        accepted = 0
+        queue: deque[str] = deque([parent_hash])
+        seen: set[str] = set()
+        relay_ttl = max(0, self._coerce_ttl(ttl, field_name="ttl") - 1)
+
+        while queue:
+            current_parent = queue.popleft()
+            if current_parent in seen:
+                continue
+            seen.add(current_parent)
+
+            with self.chain_lock:
+                self._refresh_chain_from_disk_unlocked()
+                self._prune_orphans_unlocked()
+                children = self._collect_orphan_children_unlocked(current_parent)
+
+            for child in children:
+                result = self.accept_block(child, sender="", ttl=relay_ttl, auth=None)
+                if bool(result.get("accepted")):
+                    accepted += 1
+                    queue.append(child.block_hash)
+                elif str(result.get("reason", "")).startswith("orphan"):
+                    continue
+                else:
+                    with self.chain_lock:
+                        self._drop_orphan_unlocked(child.block_hash)
+
+        return accepted
+
+    def getdata_payload(self, items_raw: Any, ttl: int = 2) -> dict[str, Any]:
+        relay_ttl = self._coerce_ttl(ttl, field_name="ttl")
+        items = self._normalize_inventory_items(items_raw, limit=self.max_getdata_items)
+        if not items:
+            return {"ok": True, "rows": [], "missing": [], "count": 0}
+
+        rows: list[dict[str, Any]] = []
+        missing: list[dict[str, str]] = []
+
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            self._prune_orphans_unlocked()
+            mempool_by_id = {tx.txid: tx for tx in self.chain.mempool}
+            blocks_by_hash = {block.block_hash: block for block in self.chain.chain}
+            blocks_by_hash.update(self._orphan_blocks)
+
+            for item in items:
+                kind = item["type"]
+                object_id = item["id"]
+                if kind == "tx":
+                    tx = mempool_by_id.get(object_id)
+                    if tx is None:
+                        missing.append(item)
+                        continue
+                    rows.append({"type": "tx", "id": object_id, "tx": tx.to_dict()})
+                    continue
+
+                block = blocks_by_hash.get(object_id)
+                if block is None:
+                    missing.append(item)
+                    continue
+                rows.append({"type": "block", "id": object_id, "block": block.to_dict()})
+
+        for row in rows:
+            row["auth"] = self._build_sender_auth(
+                purpose=row["type"],
+                object_id=row["id"],
+                ttl=relay_ttl,
+            )
+
+        return {
+            "ok": True,
+            "rows": rows,
+            "missing": missing,
+            "count": len(rows),
+        }
+
+    def _request_inventory_objects(
+        self,
+        peer_url: str,
+        items: list[dict[str, str]],
+        ttl: int,
+    ) -> dict[str, Any]:
+        requested = self._normalize_inventory_items(items, limit=self.max_getdata_items)
+        if not requested:
+            return {
+                "requested": 0,
+                "fetched": 0,
+                "accepted_tx": 0,
+                "accepted_blocks": 0,
+                "missing": 0,
+            }
+
+        relay_ttl = self._coerce_ttl(ttl, field_name="ttl")
+        contains_block = any(item.get("type") == "block" for item in requested)
+        timeout = max(self.request_timeout, 8.0) if contains_block else self.request_timeout
+
+        try:
+            response = _request_json(
+                _join_url(peer_url, "/getdata"),
+                method="POST",
+                payload={
+                    "items": requested,
+                    "ttl": relay_ttl,
+                    "from": self.node_url,
+                },
+                timeout=timeout,
+            )
+        except Exception as exc:
+            self._penalize_peer(
+                peer_url,
+                max(1, self.peer_penalty_bad_sync // 2),
+                f"getdata-fetch-failed:{str(exc)[:80]}",
+            )
+            return {
+                "requested": len(requested),
+                "fetched": 0,
+                "accepted_tx": 0,
+                "accepted_blocks": 0,
+                "missing": len(requested),
+                "error": str(exc),
+            }
+
+        rows = response.get("rows")
+        if not isinstance(rows, list):
+            self._penalize_peer(peer_url, self.peer_penalty_bad_sync, "getdata-invalid-rows")
+            return {
+                "requested": len(requested),
+                "fetched": 0,
+                "accepted_tx": 0,
+                "accepted_blocks": 0,
+                "missing": len(requested),
+                "error": "invalid-getdata-response",
+            }
+
+        requested_set = {(item["type"], item["id"]) for item in requested}
+        fetched = 0
+        accepted_tx = 0
+        accepted_blocks = 0
+        returned_set: set[tuple[str, str]] = set()
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            kind = str(row.get("type", "")).strip().lower()
+            object_id = str(row.get("id", "")).strip().lower()
+            key = (kind, object_id)
+            if key not in requested_set or key in returned_set:
+                continue
+            returned_set.add(key)
+
+            auth = row.get("auth")
+            if not isinstance(auth, dict):
+                self._penalize_peer(peer_url, max(1, self.peer_penalty_bad_sync // 2), "getdata-missing-auth")
+                continue
+
+            if kind == "tx":
+                tx_raw = row.get("tx")
+                if not isinstance(tx_raw, dict):
+                    continue
+                try:
+                    tx = Transaction.from_dict(tx_raw)
+                except Exception:
+                    self._penalize_peer(peer_url, max(1, self.peer_penalty_bad_sync // 2), "getdata-invalid-tx")
+                    continue
+                if tx.txid != object_id:
+                    self._penalize_peer(peer_url, self.peer_penalty_invalid_tx, "getdata-txid-mismatch")
+                    continue
+                fetched += 1
+                result = self.accept_transaction(tx, sender=peer_url, ttl=relay_ttl, auth=auth)
+                if bool(result.get("accepted")):
+                    accepted_tx += 1
+                continue
+
+            if kind == "block":
+                block_raw = row.get("block")
+                if not isinstance(block_raw, dict):
+                    continue
+                try:
+                    block = Block.from_dict(block_raw)
+                except Exception:
+                    self._penalize_peer(peer_url, max(1, self.peer_penalty_bad_sync // 2), "getdata-invalid-block")
+                    continue
+                if block.block_hash != object_id:
+                    self._penalize_peer(peer_url, self.peer_penalty_invalid_block, "getdata-block-hash-mismatch")
+                    continue
+                fetched += 1
+                result = self.accept_block(block, sender=peer_url, ttl=relay_ttl, auth=auth)
+                if bool(result.get("accepted")):
+                    accepted_blocks += 1
+
+        missing_count = len(requested_set - returned_set)
+        return {
+            "requested": len(requested),
+            "fetched": fetched,
+            "accepted_tx": accepted_tx,
+            "accepted_blocks": accepted_blocks,
+            "missing": missing_count,
+        }
+
+    def accept_inventory(self, items_raw: Any, sender: str = "", ttl: int = 2) -> dict[str, Any]:
+        sender_url = self._normalize_sender(sender)
+        relay_ttl = self._coerce_ttl(ttl, field_name="ttl")
+
+        if sender_url:
+            if self._is_peer_banned(sender_url):
+                return {"ok": False, "accepted": False, "reason": "sender-banned", "requested": 0}
+            if not self._is_known_peer(sender_url):
+                return {"ok": False, "accepted": False, "reason": "sender-not-known", "requested": 0}
+
+        items = self._normalize_inventory_items(items_raw, limit=self.max_inv_items)
+        if not items:
+            return {"ok": True, "accepted": False, "reason": "empty-inventory", "requested": 0}
+
+        requested: list[dict[str, str]] = []
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            self._prune_orphans_unlocked()
+
+            for item in items:
+                kind = item["type"]
+                object_id = item["id"]
+                if kind == "tx":
+                    if self._has_txid_unlocked(object_id):
+                        continue
+                    requested.append(item)
+                    continue
+
+                if self._chain_has_block_hash_unlocked(object_id) or object_id in self._seen_block_hashes:
+                    continue
+                requested.append(item)
+
+        if not requested:
+            return {
+                "ok": True,
+                "accepted": True,
+                "reason": "inventory-known",
+                "requested": 0,
+            }
+
+        if not sender_url:
+            return {
+                "ok": True,
+                "accepted": False,
+                "reason": "inventory-sender-missing",
+                "requested": len(requested),
+            }
+
+        fetch = self._request_inventory_objects(sender_url, requested, relay_ttl)
+        return {
+            "ok": True,
+            "accepted": True,
+            "reason": "inventory-requested",
+            **fetch,
+        }
+
+    def _broadcast_inventory(
+        self,
+        items: list[dict[str, str]],
+        ttl: int,
+        exclude: set[str] | None = None,
+    ) -> list[str]:
+        relay_ttl = self._coerce_ttl(ttl, field_name="ttl")
+        if relay_ttl <= 0:
+            return []
+
+        normalized_items = self._normalize_inventory_items(items, limit=self.max_inv_items)
+        if not normalized_items:
+            return []
+
+        skip = set(exclude or set())
+        failed: list[str] = []
+        for peer in self._get_relay_peers(limit=self.max_outbound_broadcast_peers):
+            if peer in skip:
+                continue
+            try:
+                _request_json(
+                    _join_url(peer, "/inv"),
+                    method="POST",
+                    payload={
+                        "items": normalized_items,
+                        "ttl": relay_ttl,
+                        "from": self.node_url,
+                    },
+                    timeout=self.request_timeout,
+                )
+            except NetworkError:
+                failed.append(peer)
+        return failed
+
     def _broadcast_tx(self, tx: Transaction, ttl: int, exclude: set[str] | None = None) -> None:
         bounded_ttl = self._coerce_ttl(ttl, field_name="ttl")
         if bounded_ttl <= 0:
             return
         skip = set(exclude or set())
+        failed_peers = self._broadcast_inventory(
+            [{"type": "tx", "id": tx.txid}],
+            ttl=bounded_ttl,
+            exclude=skip,
+        )
+        if not failed_peers:
+            return
+
         auth = self._build_sender_auth(purpose="tx", object_id=tx.txid, ttl=bounded_ttl)
-        for peer in self._get_relay_peers():
-            if peer in skip:
-                continue
+        for peer in failed_peers:
             try:
                 _request_json(
                     _join_url(peer, "/tx"),
@@ -1394,10 +1907,16 @@ class P2PNode:
         if bounded_ttl <= 0:
             return
         skip = set(exclude or set())
+        failed_peers = self._broadcast_inventory(
+            [{"type": "block", "id": block.block_hash}],
+            ttl=bounded_ttl,
+            exclude=skip,
+        )
+        if not failed_peers:
+            return
+
         auth = self._build_sender_auth(purpose="block", object_id=block.block_hash, ttl=bounded_ttl)
-        for peer in self._get_relay_peers():
-            if peer in skip:
-                continue
+        for peer in failed_peers:
             try:
                 _request_json(
                     _join_url(peer, "/block"),
@@ -1602,8 +2121,10 @@ class P2PNode:
                     )
                 return {"ok": False, "accepted": False, "reason": auth_reason, "hash": block.block_hash}
 
+        orphan_pool_size = 0
         with self.chain_lock:
             self._refresh_chain_from_disk_unlocked()
+            self._prune_orphans_unlocked()
 
             if block.block_hash in self._seen_block_hashes:
                 known_result = {"ok": True, "accepted": True, "reason": "known", "hash": block.block_hash}
@@ -1613,9 +2134,22 @@ class P2PNode:
 
             if any(existing.block_hash == block.block_hash for existing in self.chain.chain):
                 self._remember_block_hash(block.block_hash)
+                self._drop_orphan_unlocked(block.block_hash)
                 if relay_ttl > 0:
                     self._broadcast_block(block, ttl=relay_ttl - 1, exclude={sender_url} if sender_url else set())
                 return {"ok": True, "accepted": True, "reason": "known", "hash": block.block_hash}
+
+            parent_on_main_chain = any(existing.block_hash == block.prev_hash for existing in self.chain.chain)
+            if block.index > 0 and not parent_on_main_chain:
+                orphan_reason = self._store_orphan_unlocked(block)
+                return {
+                    "ok": True,
+                    "accepted": False,
+                    "reason": orphan_reason,
+                    "hash": block.block_hash,
+                    "orphan": True,
+                    "orphan_pool_size": len(self._orphan_blocks),
+                }
 
             try:
                 if not self.chain.chain and block.index == 0:
@@ -1658,17 +2192,27 @@ class P2PNode:
                     self._penalize_peer(sender_url, self.peer_penalty_invalid_block, f"invalid-block:{err[:80]}")
                     return {"ok": False, "accepted": False, "reason": err, "hash": block.block_hash}
 
+            self._drop_orphan_unlocked(block.block_hash)
             self._remember_block_hash(block.block_hash)
             for tx in block.transactions:
                 self._remember_txid(tx.txid)
             self._reward_peer(sender_url)
+            orphan_pool_size = len(self._orphan_blocks)
 
         self._broadcast_block(block, ttl=relay_ttl - 1, exclude={sender_url} if sender_url else set())
-        return {"ok": True, "accepted": True, "reason": "accepted", "hash": block.block_hash}
+        adopted_orphans = self._drain_orphans_after_parent(block.block_hash, ttl=relay_ttl)
+        return {
+            "ok": True,
+            "accepted": True,
+            "reason": "accepted",
+            "hash": block.block_hash,
+            "adopted_orphans": adopted_orphans,
+            "orphan_pool_size": orphan_pool_size,
+        }
 
     def _candidate_peer_metas(self) -> list[tuple[str, int, int]]:
         metas: list[tuple[str, int, int]] = []
-        for peer in self._get_relay_peers():
+        for peer in self._get_relay_peers(limit=self.max_outbound_sync_peers):
             try:
                 try:
                     meta = _request_json(_join_url(peer, "/headers/meta"), method="GET", timeout=self.request_timeout)

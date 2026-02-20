@@ -209,6 +209,18 @@ Weitere `node-run` Optionen:
 - `--peer-auth-max-skew-seconds`
 - `--peer-auth-replay-window-seconds`
 
+## P2P Relay + Robustness (Schritt 6)
+
+Neue Gossip-Semantik (Bitcoin-aehnlich):
+- `POST /inv` kuendigt nur Inventar (`txid`/`block hash`) an
+- `POST /getdata` liefert Full-Payload nur auf Anforderung
+- Fallback auf `/tx` und `/block` bleibt fuer Kompatibilitaet aktiv
+
+Robustheit:
+- Orphan-Block-Pool mit TTL + Groessenlimit (fehlender Parent wird zwischengespeichert)
+- Automatisches Nachziehen von Orphans, sobald der Parent angekommen ist
+- Outbound-Peer-Diversitaet fuer Broadcast/Sync (Bucket nach /16 bei IPv4, /48 bei IPv6, Domain-Suffix bei DNS)
+
 ## P2P Sync (Schritt 2)
 
 Sync nutzt jetzt zuerst einen Header-First-Pfad und faellt bei alten Peers auf Snapshot-Sync zurueck:
@@ -262,7 +274,7 @@ python powx_cli.py api-mine --node http://127.0.0.1:8844 --wallet alice.json --b
 ## Hinweise
 
 - Keys liegen unverschlüsselt in JSON-Dateien. Für echte Sicherheit: Hardware Wallet/HSM, Verschlüsselung, Key-Rotation.
-- P2P ist eine erste Version (HTTP-basiert, Full-Snapshot-Sync), noch ohne ausgereifte Reorg-/DoS-Strategien.
+- P2P bleibt HTTP-basiert, nutzt aber jetzt Header-First-Sync plus `inv/getdata`, Orphan-Handling und diversifizierte Outbound-Peer-Auswahl.
 - Schritt 3 reduziert DoS-Risiken deutlich (Rate-Limit, Request-Size-Limit, TTL-Cap, Peer-Limit, Sync-Retry-Cooldown).
 - Schritt 4 + 5 bringen Peer-Scoring/Temp-Ban, signierte Peer-Messages und persistente Reputationsdaten; fuer ein echtes Mainnet fehlen trotzdem noch robustere Anti-Sybil-/Peer-Discovery-/Reputation-Mechanismen.
 - Die Chain validiert beim Laden den gesamten Blockverlauf neu und rekonstruiert UTXOs aus den Blöcken (State-Härtung gegen manipulierte Dateien).
