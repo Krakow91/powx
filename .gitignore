@@ -1,0 +1,58 @@
+# Python cache/build
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local UI settings and runtime data
+mining_ui_settings.json
+wallet_ui_settings.json
+kk91_ui_data/
+kk91_wallet_data/
+data/
+nodeA/
+nodeB/
+wallets/
+*.csv
+*.png
+
+# Local test/smoke artifacts
+*-smoke/
+*-smoke-*/
+smoke-*/
+localtest-*/
+wallet-flow-*/
+gpu-*/
+speed-smoke-*/
+stop-smoke-*/
+ui-smoke-*/
+polish-*/
+final-*/
+direct-mine-test/
+SYNC_TEST_DIR/
+upgrade-step1-smoke/
+step2-header-sync-smoke/
+bitcoin-policy-smoke/
+cap-smoke/
+chain-improve-smoke/
+compat-regression-smoke/
+rest-regression-smoke/
+rest-step3-smoke/
+rest-step3-lib-smoke/
+rest-step3-full-smoke/
+wallet-ui-*/
+kk91-test-*/
+
+# Local secret/key files
+*.key
+*.pem
+*wallet*.json
+genesis_wallet.json
+
+# Local scraped/reference dumps
+thegraph_home_raw.html
