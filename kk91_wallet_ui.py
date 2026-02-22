@@ -4,12 +4,13 @@ import csv
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from powx.chain import Chain, ValidationError
 from powx.config import CONFIG
-from powx.mnemonic import private_key_to_backup_mnemonic
+from powx.mnemonic import backup_challenge_positions, private_key_to_backup_mnemonic, verify_backup_challenge
 from powx.wallet import (
     Wallet,
     create_seed_wallet,
@@ -17,6 +18,7 @@ from powx.wallet import (
     load_wallet,
     recover_wallet_from_seed,
     save_wallet,
+    wallet_file_requires_password,
 )
 
 try:
@@ -42,10 +44,17 @@ class KK91WalletUI(tk.Tk):
 
         self.settings_path = Path(__file__).with_name("wallet_ui_settings.json")
         settings = self._load_settings()
+        verified_seed_map_raw = settings.get("seed_backup_verified", {})
+        if not isinstance(verified_seed_map_raw, dict):
+            verified_seed_map_raw = {}
 
-        self.data_dir_var = tk.StringVar(value=settings.get("data_dir", "./kk91_data"))
-        self.wallet_path_var = tk.StringVar(value=settings.get("wallet_path", ""))
-        self.genesis_supply_var = tk.StringVar(value=settings.get("genesis_supply", "0"))
+        self.data_dir_var = tk.StringVar(value=str(settings.get("data_dir", "./kk91_data")))
+        self.wallet_path_var = tk.StringVar(value=str(settings.get("wallet_path", "")))
+        self.genesis_supply_var = tk.StringVar(value=str(settings.get("genesis_supply", "0")))
+        self.encrypt_wallet_var = tk.BooleanVar(value=bool(settings.get("encrypt_wallets", True)))
+        self.wallet_kdf_var = tk.StringVar(value=str(settings.get("wallet_kdf", "scrypt")))
+        if self.wallet_kdf_var.get().strip().lower() not in {"scrypt", "argon2id"}:
+            self.wallet_kdf_var.set("scrypt")
 
         self.status_var = tk.StringVar(value="Idle")
         self.balance_var = tk.StringVar(value="-")
@@ -58,9 +67,17 @@ class KK91WalletUI(tk.Tk):
         self.send_fee_var = tk.StringVar(value="1")
 
         self.current_wallet: Wallet | None = None
+        self.current_wallet_password: str | None = None
+        self.current_wallet_kdf: str = "scrypt"
+        self.current_wallet_encrypted: bool = False
         self._last_history_rows: list[tuple[str, str, str, str, str, str]] = []
         self.qr_preview_image = None
         self._recovery_attempted = False
+        self._seed_backup_verified_map: dict[str, bool] = {
+            str(Path(key).resolve()): bool(value)
+            for key, value in verified_seed_map_raw.items()
+            if isinstance(key, str)
+        }
 
         self._setup_style()
         self._build_layout()
@@ -159,6 +176,24 @@ class KK91WalletUI(tk.Tk):
         )
 
         style.configure(
+            "Field.TCombobox",
+            fieldbackground=tooltip,
+            background=tooltip,
+            foreground=white,
+            bordercolor=line,
+            lightcolor=line,
+            darkcolor=line,
+            arrowcolor=turquoise,
+            padding=(8, 7),
+        )
+        style.map(
+            "Field.TCombobox",
+            bordercolor=[("focus", blue)],
+            lightcolor=[("focus", blue)],
+            darkcolor=[("focus", blue)],
+        )
+
+        style.configure(
             "History.Treeview",
             rowheight=27,
             background=tooltip,
@@ -235,28 +270,57 @@ class KK91WalletUI(tk.Tk):
             row=5, column=1, sticky="ew", padx=(5, 0), pady=(0, 7)
         )
 
-        ttk.Button(card, text="Create Random Wallet", style="Action.TButton", command=self._create_random_wallet).grid(
+        ttk.Button(card, text="Unlock Wallet", style="Primary.TButton", command=self._unlock_wallet).grid(
             row=6, column=0, sticky="ew", padx=(0, 5), pady=(0, 7)
         )
-        ttk.Button(card, text="Create Seed Wallet", style="Primary.TButton", command=self._create_seed_wallet_action).grid(
+        ttk.Button(card, text="Lock Wallet", style="Action.TButton", command=self._lock_wallet).grid(
             row=6, column=1, sticky="ew", padx=(5, 0), pady=(0, 7)
         )
 
+        security_row = ttk.Frame(card, style="Card.TFrame")
+        security_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 7))
+        security_row.columnconfigure(0, weight=1)
+        security_row.columnconfigure(1, weight=0)
+
+        ttk.Checkbutton(
+            security_row,
+            text="Encrypt wallet files",
+            variable=self.encrypt_wallet_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(security_row, text="KDF", style="Meta.TLabel").grid(row=0, column=1, sticky="e", padx=(10, 4))
+        ttk.Combobox(
+            security_row,
+            textvariable=self.wallet_kdf_var,
+            values=("scrypt", "argon2id"),
+            state="readonly",
+            style="Field.TCombobox",
+            width=10,
+        ).grid(row=0, column=2, sticky="e")
+
+        ttk.Button(card, text="Create Random Wallet", style="Action.TButton", command=self._create_random_wallet).grid(
+            row=8, column=0, sticky="ew", padx=(0, 5), pady=(0, 7)
+        )
+        ttk.Button(card, text="Create Seed Wallet", style="Primary.TButton", command=self._create_seed_wallet_action).grid(
+            row=8, column=1, sticky="ew", padx=(5, 0), pady=(0, 7)
+        )
+
         ttk.Button(card, text="Recover From Seed", style="Primary.TButton", command=self._open_seed_recovery).grid(
-            row=7, column=0, sticky="ew", padx=(0, 5), pady=(0, 7)
+            row=9, column=0, sticky="ew", padx=(0, 5), pady=(0, 7)
         )
         ttk.Button(card, text="Save Settings", style="Action.TButton", command=self._save_settings).grid(
-            row=7, column=1, sticky="ew", padx=(5, 0), pady=(0, 7)
+            row=9, column=1, sticky="ew", padx=(5, 0), pady=(0, 7)
         )
 
-        ttk.Label(card, text="Genesis Supply", style="Meta.TLabel").grid(row=8, column=0, columnspan=2, sticky="w")
-        ttk.Entry(card, textvariable=self.genesis_supply_var, style="Field.TEntry").grid(row=9, column=0, columnspan=2, sticky="ew", pady=(2, 8))
+        ttk.Label(card, text="Genesis Supply", style="Meta.TLabel").grid(row=10, column=0, columnspan=2, sticky="w")
+        ttk.Entry(card, textvariable=self.genesis_supply_var, style="Field.TEntry").grid(
+            row=11, column=0, columnspan=2, sticky="ew", pady=(2, 8)
+        )
 
         ttk.Button(card, text="Init Local Chain", style="Primary.TButton", command=self._init_chain).grid(
-            row=10, column=0, sticky="ew", padx=(0, 5)
+            row=12, column=0, sticky="ew", padx=(0, 5)
         )
         ttk.Button(card, text="Refresh", style="Action.TButton", command=self._refresh_all).grid(
-            row=10, column=1, sticky="ew", padx=(5, 0)
+            row=12, column=1, sticky="ew", padx=(5, 0)
         )
 
     def _build_seed_card(self, parent: ttk.Frame) -> None:
@@ -297,6 +361,9 @@ class KK91WalletUI(tk.Tk):
         )
         ttk.Button(card, text="Recover Wallet", style="Primary.TButton", command=self._open_seed_recovery).grid(
             row=3, column=2, sticky="ew", padx=(4, 0)
+        )
+        ttk.Button(card, text="Run Backup Check", style="Action.TButton", command=self._run_seed_backup_check).grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
 
     def _build_receive_card(self, parent: ttk.Frame) -> None:
@@ -442,23 +509,31 @@ class KK91WalletUI(tk.Tk):
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _load_settings(self) -> dict[str, str]:
+    def _load_settings(self) -> dict[str, Any]:
         if not self.settings_path.exists():
             return {}
         try:
             with self.settings_path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
             if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
+                return data
         except Exception:
             return {}
         return {}
 
     def _save_settings(self) -> None:
+        seed_verified = {
+            str(Path(path).resolve()): bool(flag)
+            for path, flag in self._seed_backup_verified_map.items()
+            if bool(flag)
+        }
         data = {
             "data_dir": self.data_dir_var.get().strip() or "./kk91_data",
             "wallet_path": self.wallet_path_var.get().strip(),
             "genesis_supply": self.genesis_supply_var.get().strip() or "0",
+            "encrypt_wallets": bool(self.encrypt_wallet_var.get()),
+            "wallet_kdf": self.wallet_kdf_var.get().strip().lower() or "scrypt",
+            "seed_backup_verified": seed_verified,
         }
         with self.settings_path.open("w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2)
@@ -504,12 +579,135 @@ class KK91WalletUI(tk.Tk):
                 return path
         raise RuntimeError("Could not create a unique wallet filename")
 
-    def _activate_wallet(self, wallet: Wallet, path: Path, status_text: str) -> None:
+    @staticmethod
+    def _wallet_key(path: str | Path) -> str:
+        return str(Path(path).resolve())
+
+    def _is_seed_backup_verified(self, path: str | Path) -> bool:
+        return bool(self._seed_backup_verified_map.get(self._wallet_key(path), False))
+
+    def _set_seed_backup_verified(self, path: str | Path, verified: bool) -> None:
+        key = self._wallet_key(path)
+        if verified:
+            self._seed_backup_verified_map[key] = True
+        elif key in self._seed_backup_verified_map:
+            del self._seed_backup_verified_map[key]
+
+    def _current_seed_backup_verified(self) -> bool:
+        wallet_path = self.wallet_path_var.get().strip()
+        if not wallet_path:
+            return False
+        return self._is_seed_backup_verified(wallet_path)
+
+    def _prompt_wallet_password(
+        self,
+        title: str,
+        *,
+        confirm: bool = False,
+        allow_empty: bool = False,
+        parent: tk.Misc | None = None,
+    ) -> str | None:
+        owner = self if parent is None else parent
+        prompt = "Wallet password:"
+        first = simpledialog.askstring(title, prompt, parent=owner, show="*")
+        if first is None:
+            return None
+        first = first.strip()
+        if not allow_empty and not first:
+            messagebox.showerror(title, "Password must not be empty", parent=owner)
+            return None
+
+        if not confirm:
+            return first
+
+        second = simpledialog.askstring(title, "Confirm password:", parent=owner, show="*")
+        if second is None:
+            return None
+        if first != second.strip():
+            messagebox.showerror(title, "Passwords do not match", parent=owner)
+            return None
+        return first
+
+    @staticmethod
+    def _read_wallet_meta(path: Path) -> dict[str, Any]:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return data
+        return {}
+
+    def _load_wallet_from_path(self, path: Path, prompt: bool = True) -> tuple[Wallet, bool, str | None, str]:
+        encrypted = wallet_file_requires_password(path)
+        wallet_password: str | None = None
+        wallet_kdf = "scrypt"
+
+        if encrypted:
+            meta = self._read_wallet_meta(path)
+            kdf_obj = meta.get("kdf")
+            if isinstance(kdf_obj, dict):
+                wallet_kdf = str(kdf_obj.get("name", "scrypt")).strip().lower() or "scrypt"
+
+            if prompt:
+                wallet_password = self._prompt_wallet_password("Unlock encrypted wallet")
+                if wallet_password is None:
+                    raise ValidationError("Wallet unlock cancelled")
+            else:
+                raise ValidationError("Encrypted wallet is locked")
+
+        try:
+            wallet = load_wallet(path, password=wallet_password)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        except Exception as exc:
+            raise ValidationError(f"Failed to load wallet: {exc}") from exc
+
+        return wallet, encrypted, wallet_password, wallet_kdf
+
+    def _resolve_wallet_save_security(self, parent: tk.Misc | None = None) -> tuple[bool, str | None, str]:
+        selected_kdf = self.wallet_kdf_var.get().strip().lower() or "scrypt"
+        if selected_kdf not in {"scrypt", "argon2id"}:
+            selected_kdf = "scrypt"
+            self.wallet_kdf_var.set(selected_kdf)
+
+        if self.current_wallet_encrypted:
+            if not self.current_wallet_password:
+                password = self._prompt_wallet_password("Wallet password required", confirm=False, parent=parent)
+                if password is None:
+                    raise ValidationError("Wallet password is required")
+                self.current_wallet_password = password
+            return True, self.current_wallet_password, self.current_wallet_kdf or selected_kdf
+
+        if not bool(self.encrypt_wallet_var.get()):
+            return False, None, selected_kdf
+
+        password = self.current_wallet_password
+        if not password:
+            password = self._prompt_wallet_password("Set wallet password", confirm=True, parent=parent)
+            if password is None:
+                raise ValidationError("Wallet encryption cancelled")
+            self.current_wallet_password = password
+        return True, password, selected_kdf
+
+    def _activate_wallet(
+        self,
+        wallet: Wallet,
+        path: Path,
+        status_text: str,
+        *,
+        encrypted: bool,
+        password: str | None,
+        kdf: str,
+    ) -> None:
         self.current_wallet = wallet
+        self.current_wallet_encrypted = bool(encrypted)
+        self.current_wallet_password = password if encrypted else None
+        self.current_wallet_kdf = (kdf or "scrypt").strip().lower() if encrypted else self.wallet_kdf_var.get().strip().lower() or "scrypt"
         self.wallet_path_var.set(str(path))
         self._set_address(wallet.address)
         self._set_seed_phrase(wallet.mnemonic)
         self.status_var.set(status_text)
+        if not wallet.mnemonic.strip():
+            self._set_seed_backup_verified(path, verified=True)
         self._save_settings()
         self._refresh_all()
 
@@ -529,13 +727,29 @@ class KK91WalletUI(tk.Tk):
             return
 
         try:
-            wallet = load_wallet(path_obj)
+            if wallet_file_requires_password(path_obj):
+                self.current_wallet = None
+                self.current_wallet_password = None
+                self.current_wallet_encrypted = True
+                self.current_wallet_kdf = "scrypt"
+                self._set_address("Encrypted wallet selected")
+                self._set_seed_phrase("")
+                self.status_var.set("Wallet locked")
+                return
+
+            wallet, encrypted, password, kdf = self._load_wallet_from_path(path_obj, prompt=False)
             self.current_wallet = wallet
+            self.current_wallet_password = password
+            self.current_wallet_encrypted = encrypted
+            self.current_wallet_kdf = kdf
             self._set_address(wallet.address)
             self._set_seed_phrase(wallet.mnemonic)
             self.status_var.set("Wallet loaded")
         except Exception:
             self.current_wallet = None
+            self.current_wallet_password = None
+            self.current_wallet_encrypted = False
+            self.current_wallet_kdf = "scrypt"
             self._set_address("No wallet loaded")
             self._set_seed_phrase("")
             self.status_var.set("No wallet loaded")
@@ -546,41 +760,96 @@ class KK91WalletUI(tk.Tk):
             messagebox.showerror("Wallet", "Please select a wallet file")
             return
 
+        path_obj = Path(wallet_path)
+        if not path_obj.exists():
+            messagebox.showerror("Wallet", "Wallet file not found")
+            return
+
         try:
-            wallet = load_wallet(wallet_path)
-            self.current_wallet = wallet
-            self._set_address(wallet.address)
-            self._set_seed_phrase(wallet.mnemonic)
-            self.status_var.set("Wallet loaded")
-            self._save_settings()
+            wallet, encrypted, password, kdf = self._load_wallet_from_path(path_obj, prompt=True)
+            self._activate_wallet(
+                wallet,
+                path_obj,
+                "Wallet unlocked" if encrypted else "Wallet loaded",
+                encrypted=encrypted,
+                password=password,
+                kdf=kdf,
+            )
             self._log(f"Wallet loaded: {wallet_path}")
-            self._refresh_all()
         except Exception as exc:
             messagebox.showerror("Wallet", f"Failed to load wallet:\n{exc}")
+
+    def _unlock_wallet(self) -> None:
+        self._load_selected_wallet()
+
+    def _lock_wallet(self) -> None:
+        if self.current_wallet is None:
+            self.status_var.set("Wallet locked")
+            return
+
+        wallet_path = self.wallet_path_var.get().strip()
+        encrypted = False
+        if wallet_path:
+            try:
+                encrypted = wallet_file_requires_password(Path(wallet_path))
+            except Exception:
+                encrypted = False
+
+        self.current_wallet = None
+        self.current_wallet_password = None
+        self.current_wallet_encrypted = encrypted
+        self._set_address("Encrypted wallet selected" if encrypted else "Wallet selected")
+        self._set_seed_phrase("")
+        self.balance_var.set("-")
+        self._fill_history([])
+        self.status_var.set("Wallet locked")
+        self._log("Wallet locked")
 
     def _create_random_wallet(self) -> None:
         wallets_dir = self._wallets_dir()
         wallet = create_wallet(CONFIG.symbol)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self._unique_wallet_path(wallets_dir, f"wallet_{stamp}")
-        save_wallet(wallet, path)
-
-        self._activate_wallet(wallet, path, "Wallet created")
-        self._log(f"Wallet created: {path}")
+        try:
+            encrypted, password, kdf = self._resolve_wallet_save_security(parent=self)
+            save_wallet(wallet, path, password=password if encrypted else None, kdf=kdf)
+            self._activate_wallet(
+                wallet,
+                path,
+                "Wallet created",
+                encrypted=encrypted,
+                password=password,
+                kdf=kdf,
+            )
+            self._log(f"Wallet created: {path}")
+        except Exception as exc:
+            messagebox.showerror("Wallet", f"Failed to create wallet:\n{exc}")
 
     def _create_seed_wallet_action(self) -> None:
         wallets_dir = self._wallets_dir()
         wallet = create_seed_wallet(CONFIG.symbol)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self._unique_wallet_path(wallets_dir, f"wallet_seed_{stamp}")
-        save_wallet(wallet, path)
-
-        self._activate_wallet(wallet, path, "Seed wallet created")
-        self._log(f"Seed wallet created: {path}")
-        messagebox.showinfo(
-            "Seed phrase",
-            "New wallet with seed phrase created.\nWrite the phrase down offline before closing.",
-        )
+        try:
+            encrypted, password, kdf = self._resolve_wallet_save_security(parent=self)
+            save_wallet(wallet, path, password=password if encrypted else None, kdf=kdf)
+            self._set_seed_backup_verified(path, verified=False)
+            self._activate_wallet(
+                wallet,
+                path,
+                "Seed wallet created",
+                encrypted=encrypted,
+                password=password,
+                kdf=kdf,
+            )
+            self._log(f"Seed wallet created: {path}")
+            messagebox.showinfo(
+                "Seed phrase",
+                "New wallet with seed phrase created.\nWrite the phrase down offline before closing.",
+            )
+            self._run_seed_backup_check(force_prompt=True)
+        except Exception as exc:
+            messagebox.showerror("Seed wallet", f"Failed to create seed wallet:\n{exc}")
 
     def _open_seed_recovery(self) -> None:
         dialog = tk.Toplevel(self)
@@ -629,10 +898,20 @@ class KK91WalletUI(tk.Tk):
                 wallets_dir = self._wallets_dir()
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 path = self._unique_wallet_path(wallets_dir, f"wallet_recovered_{stamp}")
-                save_wallet(wallet, path)
-                self._activate_wallet(wallet, path, "Wallet recovered")
+                encrypted, password, kdf = self._resolve_wallet_save_security(parent=dialog)
+                save_wallet(wallet, path, password=password if encrypted else None, kdf=kdf)
+                self._set_seed_backup_verified(path, verified=False)
+                self._activate_wallet(
+                    wallet,
+                    path,
+                    "Wallet recovered",
+                    encrypted=encrypted,
+                    password=password,
+                    kdf=kdf,
+                )
                 self._log(f"Wallet recovered from seed: {path}")
                 dialog.destroy()
+                self._run_seed_backup_check(force_prompt=True)
             except Exception as exc:
                 messagebox.showerror("Recover", f"Failed to recover wallet:\n{exc}", parent=dialog)
 
@@ -664,7 +943,11 @@ class KK91WalletUI(tk.Tk):
             path = self._unique_wallet_path(wallets_dir, f"wallet_{stamp}")
             self.wallet_path_var.set(str(path))
 
-        save_wallet(self.current_wallet, path)
+        encrypted, password, kdf = self._resolve_wallet_save_security(parent=self)
+        save_wallet(self.current_wallet, path, password=password if encrypted else None, kdf=kdf)
+        self.current_wallet_encrypted = encrypted
+        self.current_wallet_password = password if encrypted else None
+        self.current_wallet_kdf = kdf if encrypted else self.wallet_kdf_var.get().strip().lower() or "scrypt"
         self._save_settings()
         return path
 
@@ -681,6 +964,7 @@ class KK91WalletUI(tk.Tk):
             backup = private_key_to_backup_mnemonic(self.current_wallet.private_key)
             self.current_wallet.mnemonic = backup
             path = self._persist_current_wallet()
+            self._set_seed_backup_verified(path, verified=False)
             self._set_seed_phrase(backup)
             self.status_var.set("Backup seed created")
             self._log(f"Backup seed created and saved: {path}")
@@ -688,6 +972,7 @@ class KK91WalletUI(tk.Tk):
                 "Backup seed created",
                 "A backup seed phrase was generated for this wallet.\nWrite it down offline and keep it private.",
             )
+            self._run_seed_backup_check(force_prompt=True)
         except Exception as exc:
             messagebox.showerror("Backup seed", f"Failed to create backup seed:\n{exc}")
 
@@ -702,6 +987,91 @@ class KK91WalletUI(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(mnemonic)
         self._log("Seed phrase copied to clipboard")
+
+    def _run_seed_backup_check(self, force_prompt: bool = False) -> bool:
+        if self.current_wallet is None:
+            messagebox.showerror("Seed backup check", "Load or create a wallet first")
+            return False
+
+        wallet_path = self.wallet_path_var.get().strip()
+        if not wallet_path:
+            messagebox.showerror("Seed backup check", "Wallet path is missing")
+            return False
+
+        mnemonic = self.current_wallet.mnemonic.strip()
+        if not mnemonic:
+            messagebox.showerror("Seed backup check", "Current wallet has no seed phrase")
+            return False
+
+        if self._current_seed_backup_verified() and not force_prompt:
+            messagebox.showinfo("Seed backup check", "This wallet already passed backup verification.")
+            return True
+
+        try:
+            positions = backup_challenge_positions(mnemonic, count=3)
+        except Exception as exc:
+            messagebox.showerror("Seed backup check", f"Could not create challenge:\n{exc}")
+            return False
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Seed Backup Check")
+        dialog.configure(bg="#0C0B1E")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, style="Card.TFrame", padding=(14, 12))
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Seed Backup Check", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            frame,
+            text="Enter the requested seed words to verify your backup.",
+            style="Meta.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        entry_fields: list[ttk.Entry] = []
+        for idx, position in enumerate(positions):
+            ttk.Label(frame, text=f"Word #{position}", style="Meta.TLabel").grid(row=2 + idx, column=0, sticky="w", pady=(0, 6))
+            entry = ttk.Entry(frame, style="Field.TEntry")
+            entry.grid(row=2 + idx, column=1, sticky="ew", pady=(0, 6))
+            entry_fields.append(entry)
+
+        if entry_fields:
+            entry_fields[0].focus_set()
+
+        result = {"ok": False}
+
+        def verify_now() -> None:
+            words = [entry.get().strip().lower() for entry in entry_fields]
+            if any(not word for word in words):
+                messagebox.showerror("Seed backup check", "Please fill all requested words", parent=dialog)
+                return
+
+            ok = verify_backup_challenge(mnemonic, positions=positions, provided_words=words)
+            if not ok:
+                messagebox.showerror("Seed backup check", "Backup check failed. Words do not match.", parent=dialog)
+                return
+
+            self._set_seed_backup_verified(wallet_path, verified=True)
+            self._save_settings()
+            self.status_var.set("Seed backup verified")
+            self._log("Seed backup check passed")
+            result["ok"] = True
+            messagebox.showinfo("Seed backup check", "Backup check passed.", parent=dialog)
+            dialog.destroy()
+
+        ttk.Button(frame, text="Verify", style="Primary.TButton", command=verify_now).grid(
+            row=6, column=0, sticky="ew", padx=(0, 5), pady=(8, 0)
+        )
+        ttk.Button(frame, text="Cancel", style="Action.TButton", command=dialog.destroy).grid(
+            row=6, column=1, sticky="ew", padx=(5, 0), pady=(8, 0)
+        )
+
+        self.wait_window(dialog)
+        return bool(result["ok"])
 
     def _can_render_qr(self) -> bool:
         return qrcode is not None and Image is not None and ImageTk is not None
@@ -1097,9 +1467,9 @@ class KK91WalletUI(tk.Tk):
             self.mempool_var.set("-")
             self.utxo_var.set("-")
             self._fill_history([])
-            if self.current_wallet is None:
+            if self.current_wallet is None and not self.status_var.get().startswith("Wallet locked"):
                 self.status_var.set("No wallet loaded")
-            else:
+            elif self.current_wallet is not None:
                 self.status_var.set("Chain missing")
             return
 
@@ -1119,7 +1489,8 @@ class KK91WalletUI(tk.Tk):
         else:
             self.balance_var.set("-")
             self._fill_history([])
-            self.status_var.set("Wallet not loaded")
+            if not self.status_var.get().startswith("Wallet locked"):
+                self.status_var.set("Wallet not loaded")
 
     def _periodic_refresh(self) -> None:
         try:
@@ -1129,6 +1500,14 @@ class KK91WalletUI(tk.Tk):
         self.after(2600, self._periodic_refresh)
 
     def _on_close(self) -> None:
+        if self.current_wallet is not None and self.current_wallet.mnemonic.strip():
+            if not self._current_seed_backup_verified():
+                proceed = messagebox.askyesno(
+                    "Seed backup not verified",
+                    "This wallet has a seed phrase but no completed backup check.\nClose anyway?",
+                )
+                if not proceed:
+                    return
         try:
             self._save_settings()
         except Exception:

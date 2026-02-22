@@ -21,6 +21,8 @@ ADDR_B = address_from_public_key(private_key_to_public_key(PRIV_B).hex(), "KK91"
 
 FAST_CONFIG = replace(
     CONFIG,
+    consensus_lock_enabled=False,
+    chain_id="kk91-fuzz-test",
     max_target=2**255,
     initial_target=2**255,
 )
@@ -176,7 +178,9 @@ class ConsensusFuzzTest(unittest.TestCase):
                     continue
 
                 try:
-                    _validated_chain, _validated_utxos = chain.validate_chain_blocks(blocks)
+                    _validated_chain, _validated_utxos, _validated_nfts, _validated_nft_listings, _validated_contracts = (
+                        chain.validate_chain_blocks(blocks)
+                    )
                 except ValidationError:
                     continue
                 except Exception as exc:

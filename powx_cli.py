@@ -1,18 +1,27 @@
 ﻿from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 from pathlib import Path
 
 from powx.chain import Chain, ValidationError
+from powx.market_backend import MarketplaceBackend
+from powx.market_indexer import MarketIndexer, MarketIndexerError
+from powx.mnemonic import backup_challenge_positions, verify_backup_challenge
+from powx.models import Transaction
 from powx.p2p import (
     NetworkError,
     P2PNode,
     add_peer_to_node,
     api_balance,
     api_chain,
+    api_contracts,
     api_create_transaction,
     api_history,
+    api_nft_listings,
+    api_nfts,
     api_mempool,
     api_mine,
     api_status,
@@ -21,7 +30,7 @@ from powx.p2p import (
     submit_transaction,
     trigger_node_sync,
 )
-from powx.wallet import create_wallet, load_wallet, save_wallet
+from powx.wallet import Wallet, create_seed_wallet, create_wallet, load_wallet, save_wallet
 
 
 def _load_chain(data_dir: str, must_exist: bool = True) -> Chain:
@@ -38,15 +47,131 @@ def _load_chain(data_dir: str, must_exist: bool = True) -> Chain:
     return chain
 
 
+def _resolve_wallet_password(args: argparse.Namespace, prompt_if_missing: bool = False) -> str | None:
+    direct = str(getattr(args, "wallet_password", "") or "").strip()
+    if direct:
+        return direct
+
+    env_name = str(getattr(args, "wallet_password_env", "") or "").strip()
+    if env_name:
+        value = os.environ.get(env_name)
+        if value is None:
+            raise ValidationError(f"Wallet password environment variable '{env_name}' is not set")
+        if not value:
+            raise ValidationError(f"Wallet password environment variable '{env_name}' is empty")
+        return value
+
+    wants_prompt = bool(getattr(args, "wallet_password_prompt", False))
+    if wants_prompt or prompt_if_missing:
+        try:
+            entered = getpass.getpass("Wallet password: ")
+        except Exception as exc:
+            raise ValidationError(f"Failed to read wallet password: {exc}") from exc
+        if not entered:
+            raise ValidationError("Wallet password must not be empty")
+        return entered
+
+    return None
+
+
+def _load_wallet_with_args(
+    path: str | Path,
+    args: argparse.Namespace,
+    prompt_on_encrypted: bool = True,
+) -> Wallet:
+    password = _resolve_wallet_password(args, prompt_if_missing=False)
+    try:
+        return load_wallet(path, password=password)
+    except ValueError as exc:
+        msg = str(exc)
+        if prompt_on_encrypted and (not password) and "Encrypted wallet requires password" in msg:
+            prompted = _resolve_wallet_password(args, prompt_if_missing=True)
+            return load_wallet(path, password=prompted)
+        raise ValidationError(msg) from exc
+
+
+def _add_wallet_password_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--wallet-password", help="Wallet password for encrypted wallet files")
+    parser.add_argument("--wallet-password-env", help="Environment variable containing wallet password")
+    parser.add_argument("--wallet-password-prompt", action="store_true", help="Prompt for wallet password")
+
+
+def _read_tx_file(path: str | Path) -> Transaction:
+    source = Path(path)
+    try:
+        with source.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        raise ValidationError(f"Failed to read transaction file '{source}': {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValidationError("Transaction file must contain a JSON object")
+    try:
+        return Transaction.from_dict(data)
+    except Exception as exc:
+        raise ValidationError(f"Invalid transaction JSON: {exc}") from exc
+
+
+def _write_json_file(path: str | Path, payload: dict[str, object]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def _parse_positions_csv(raw: str) -> list[int]:
+    text = raw.strip()
+    if not text:
+        raise ValidationError("Positions cannot be empty")
+    values: list[int] = []
+    for chunk in text.split(","):
+        token = chunk.strip()
+        if not token:
+            raise ValidationError("Positions list contains an empty value")
+        try:
+            value = int(token)
+        except ValueError as exc:
+            raise ValidationError(f"Invalid position value: '{token}'") from exc
+        values.append(value)
+    return values
+
+
+def _parse_words_csv(raw: str) -> list[str]:
+    text = raw.strip()
+    if not text:
+        raise ValidationError("Words cannot be empty")
+    values: list[str] = []
+    for chunk in text.split(","):
+        token = chunk.strip().lower()
+        if not token:
+            raise ValidationError("Words list contains an empty value")
+        values.append(token)
+    return values
+
+
 def cmd_wallet_new(args: argparse.Namespace) -> None:
-    wallet = create_wallet()
-    save_wallet(wallet, args.out)
+    wallet = create_seed_wallet() if bool(args.seed) else create_wallet()
+    password: str | None = None
+    if bool(args.encrypt):
+        password = _resolve_wallet_password(args, prompt_if_missing=True)
+
+    try:
+        save_wallet(wallet, args.out, password=password, kdf=args.kdf)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
     print(f"Wallet created: {args.out}")
-    print(json.dumps(wallet.to_dict(), indent=2))
+    summary = {
+        "address": wallet.address,
+        "public_key": wallet.public_key,
+        "mnemonic_words": len(wallet.mnemonic.split()) if wallet.mnemonic else 0,
+        "encrypted": bool(password),
+        "kdf": args.kdf if password else "",
+    }
+    print(json.dumps(summary, indent=2))
 
 
 def cmd_wallet_address(args: argparse.Namespace) -> None:
-    wallet = load_wallet(args.wallet)
+    wallet = _load_wallet_with_args(args.wallet, args)
     print(wallet.address)
 
 
@@ -56,7 +181,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         raise ValidationError("Chain is already initialized")
 
     if args.genesis_wallet:
-        wallet = load_wallet(args.genesis_wallet)
+        wallet = _load_wallet_with_args(args.genesis_wallet, args)
     elif args.genesis_address:
         wallet = None
     else:
@@ -81,7 +206,7 @@ def cmd_balance(args: argparse.Namespace) -> None:
     chain = _load_chain(args.data_dir)
 
     if args.wallet:
-        address = load_wallet(args.wallet).address
+        address = _load_wallet_with_args(args.wallet, args).address
     else:
         address = args.address
 
@@ -90,7 +215,7 @@ def cmd_balance(args: argparse.Namespace) -> None:
 
 def _miner_address(args: argparse.Namespace) -> str:
     if args.wallet:
-        return load_wallet(args.wallet).address
+        return _load_wallet_with_args(args.wallet, args).address
     return args.address
 
 
@@ -121,7 +246,7 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
 def cmd_send(args: argparse.Namespace) -> None:
     chain = _load_chain(args.data_dir)
-    wallet = load_wallet(args.wallet)
+    wallet = _load_wallet_with_args(args.wallet, args)
 
     tx = chain.create_transaction(
         private_key_hex=wallet.private_key,
@@ -147,6 +272,113 @@ def cmd_send(args: argparse.Namespace) -> None:
             indent=2,
         )
     )
+
+
+def cmd_tx_build_offline(args: argparse.Namespace) -> None:
+    chain = _load_chain(args.data_dir)
+
+    if args.from_wallet:
+        sender_pubkey = _load_wallet_with_args(args.from_wallet, args).public_key
+    else:
+        sender_pubkey = str(args.from_pubkey).strip().lower()
+        if not sender_pubkey:
+            raise ValidationError("Sender pubkey is required")
+
+    tx = chain.create_unsigned_transaction(
+        sender_pubkey=sender_pubkey,
+        to_address=args.to,
+        amount=args.amount,
+        fee=args.fee,
+    )
+    _write_json_file(args.out, tx.to_dict())
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "out": str(Path(args.out)),
+                "inputs": len(tx.inputs),
+                "outputs": len(tx.outputs),
+                "unsigned": True,
+            },
+            indent=2,
+        )
+    )
+
+
+def cmd_tx_sign_offline(args: argparse.Namespace) -> None:
+    unsigned_tx = _read_tx_file(args.tx_in)
+    wallet = _load_wallet_with_args(args.wallet, args)
+
+    chain = Chain(Path("."))
+    signed_tx = chain.sign_transaction(unsigned_tx, private_key_hex=wallet.private_key)
+    _write_json_file(args.tx_out, signed_tx.to_dict())
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "txid": signed_tx.txid,
+                "out": str(Path(args.tx_out)),
+                "inputs": len(signed_tx.inputs),
+                "outputs": len(signed_tx.outputs),
+            },
+            indent=2,
+        )
+    )
+
+
+def cmd_tx_send_signed(args: argparse.Namespace) -> None:
+    tx = _read_tx_file(args.tx)
+    ttl = int(args.broadcast_ttl)
+
+    if args.node:
+        try:
+            result = submit_transaction(args.node, tx, ttl=ttl)
+        except NetworkError as exc:
+            raise ValidationError(f"Transaction broadcast failed: {exc}") from exc
+        print(json.dumps({"ok": True, "mode": "node", "result": result}, indent=2))
+        return
+
+    chain = _load_chain(args.data_dir)
+    chain.add_transaction(tx)
+    result: dict[str, object] = {
+        "ok": True,
+        "mode": "local-chain",
+        "txid": tx.txid,
+    }
+    if args.broadcast_node:
+        try:
+            broadcast = submit_transaction(args.broadcast_node, tx, ttl=ttl)
+        except NetworkError as exc:
+            raise ValidationError(f"Transaction broadcast failed: {exc}") from exc
+        result["broadcast_result"] = broadcast
+
+    print(json.dumps(result, indent=2))
+
+
+def cmd_seed_backup_challenge(args: argparse.Namespace) -> None:
+    wallet = _load_wallet_with_args(args.wallet, args)
+    mnemonic = wallet.mnemonic.strip()
+    if not mnemonic:
+        raise ValidationError("Wallet has no seed phrase saved")
+
+    try:
+        positions = backup_challenge_positions(mnemonic, count=args.count)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    print(json.dumps({"ok": True, "positions": positions}, indent=2))
+
+
+def cmd_seed_backup_verify(args: argparse.Namespace) -> None:
+    wallet = _load_wallet_with_args(args.wallet, args)
+    mnemonic = wallet.mnemonic.strip()
+    if not mnemonic:
+        raise ValidationError("Wallet has no seed phrase saved")
+
+    positions = _parse_positions_csv(args.positions)
+    words = _parse_words_csv(args.words)
+    ok = verify_backup_challenge(mnemonic, positions=positions, provided_words=words)
+    print(json.dumps({"ok": ok, "positions": positions}, indent=2))
 
 
 def cmd_chain(args: argparse.Namespace) -> None:
@@ -249,7 +481,7 @@ def cmd_api_status(args: argparse.Namespace) -> None:
 
 def cmd_api_balance(args: argparse.Namespace) -> None:
     if args.wallet:
-        address = load_wallet(args.wallet).address
+        address = _load_wallet_with_args(args.wallet, args).address
     else:
         address = args.address
 
@@ -278,7 +510,7 @@ def cmd_api_mempool(args: argparse.Namespace) -> None:
 
 def cmd_api_history(args: argparse.Namespace) -> None:
     if args.wallet:
-        address = load_wallet(args.wallet).address
+        address = _load_wallet_with_args(args.wallet, args).address
     else:
         address = args.address
 
@@ -289,8 +521,34 @@ def cmd_api_history(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2))
 
 
+def cmd_api_nfts(args: argparse.Namespace) -> None:
+    token_id = str(args.token_id).strip() if args.token_id else None
+    try:
+        result = api_nfts(args.node, token_id=token_id, timeout=args.timeout)
+    except NetworkError as exc:
+        raise ValidationError(str(exc)) from exc
+    print(json.dumps(result, indent=2))
+
+
+def cmd_api_nft_listings(args: argparse.Namespace) -> None:
+    try:
+        result = api_nft_listings(args.node, timeout=args.timeout)
+    except NetworkError as exc:
+        raise ValidationError(str(exc)) from exc
+    print(json.dumps(result, indent=2))
+
+
+def cmd_api_contracts(args: argparse.Namespace) -> None:
+    contract_id = str(args.contract_id).strip() if args.contract_id else None
+    try:
+        result = api_contracts(args.node, contract_id=contract_id, timeout=args.timeout)
+    except NetworkError as exc:
+        raise ValidationError(str(exc)) from exc
+    print(json.dumps(result, indent=2))
+
+
 def cmd_api_send(args: argparse.Namespace) -> None:
-    wallet = load_wallet(args.wallet)
+    wallet = _load_wallet_with_args(args.wallet, args)
     try:
         result = api_create_transaction(
             args.node,
@@ -323,6 +581,53 @@ def cmd_api_mine(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2))
 
 
+def cmd_market_sync(args: argparse.Namespace) -> None:
+    try:
+        indexer = MarketIndexer(
+            db_path=args.db,
+            node_url=args.node,
+            timeout=args.timeout,
+        )
+        result = indexer.sync_once()
+    except (NetworkError, MarketIndexerError) as exc:
+        raise ValidationError(str(exc)) from exc
+    print(json.dumps({"ok": True, "db": str(Path(args.db)), "result": result}, indent=2))
+
+
+def cmd_market_run(args: argparse.Namespace) -> None:
+    backend = MarketplaceBackend(
+        node_url=args.node,
+        db_path=args.db,
+        host=args.host,
+        port=args.port,
+        sync_interval=args.sync_interval,
+        request_timeout=args.timeout,
+        static_dir=args.static_dir,
+        auto_sync=not bool(args.no_auto_sync),
+    )
+    print(
+        json.dumps(
+            {
+                "service_url": backend.base_url,
+                "node_url": backend.node_url,
+                "db": str(Path(args.db)),
+                "sync_interval_seconds": args.sync_interval,
+                "auto_sync": not bool(args.no_auto_sync),
+                "static_dir": str(backend.static_dir),
+            },
+            indent=2,
+        )
+    )
+    print("Market web backend running. Press Ctrl+C to stop.")
+
+    try:
+        backend.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        backend.shutdown()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="powx",
@@ -332,10 +637,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     wallet_new = subparsers.add_parser("wallet-new", help="Create a new wallet")
     wallet_new.add_argument("--out", default="wallet.json", help="Wallet output file")
+    wallet_new.add_argument("--seed", action="store_true", help="Create mnemonic-backed wallet")
+    wallet_new.add_argument("--kdf", choices=["scrypt", "argon2id"], default="scrypt", help="Wallet file KDF")
+    wallet_new.add_argument("--encrypt", dest="encrypt", action="store_true", default=True, help="Encrypt wallet file")
+    wallet_new.add_argument("--no-encrypt", dest="encrypt", action="store_false", help="Store wallet file in plaintext")
+    _add_wallet_password_args(wallet_new)
     wallet_new.set_defaults(func=cmd_wallet_new)
 
     wallet_address = subparsers.add_parser("wallet-address", help="Print wallet address")
     wallet_address.add_argument("--wallet", required=True, help="Wallet file path")
+    _add_wallet_password_args(wallet_address)
     wallet_address.set_defaults(func=cmd_wallet_address)
 
     init = subparsers.add_parser("init", help="Initialize chain state")
@@ -343,6 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--genesis-wallet", help="Wallet file for genesis funds")
     init.add_argument("--genesis-address", help="Address for genesis funds")
     init.add_argument("--genesis-supply", type=int, default=0, help="Genesis coin supply (default: 0 for no premine)")
+    _add_wallet_password_args(init)
     init.set_defaults(func=cmd_init)
 
     status = subparsers.add_parser("status", help="Show chain status")
@@ -354,6 +666,7 @@ def build_parser() -> argparse.ArgumentParser:
     source = balance.add_mutually_exclusive_group(required=True)
     source.add_argument("--address", help="Address")
     source.add_argument("--wallet", help="Wallet file")
+    _add_wallet_password_args(balance)
     balance.set_defaults(func=cmd_balance)
 
     mine = subparsers.add_parser("mine", help="Mine new blocks")
@@ -364,6 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     miner = mine.add_mutually_exclusive_group(required=True)
     miner.add_argument("--address", help="Miner address")
     miner.add_argument("--wallet", help="Miner wallet file")
+    _add_wallet_password_args(mine)
     mine.set_defaults(func=cmd_mine)
 
     send = subparsers.add_parser("send", help="Create and broadcast a transaction")
@@ -373,7 +687,54 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--amount", type=int, required=True, help="Amount")
     send.add_argument("--fee", type=int, help="Optional fee, default is minimum fee")
     send.add_argument("--broadcast-node", help="Optional node URL to broadcast transaction")
+    _add_wallet_password_args(send)
     send.set_defaults(func=cmd_send)
+
+    tx_build_offline = subparsers.add_parser("tx-build-offline", help="Build unsigned transaction for offline signing")
+    tx_build_offline.add_argument("--data-dir", default="./data", help="Data directory")
+    tx_build_source = tx_build_offline.add_mutually_exclusive_group(required=True)
+    tx_build_source.add_argument("--from-wallet", help="Wallet file to derive sender public key")
+    tx_build_source.add_argument("--from-pubkey", help="Sender compressed public key (hex)")
+    tx_build_offline.add_argument("--to", required=True, help="Recipient address")
+    tx_build_offline.add_argument("--amount", type=int, required=True, help="Amount")
+    tx_build_offline.add_argument("--fee", type=int, help="Optional fee")
+    tx_build_offline.add_argument("--out", default="unsigned_tx.json", help="Unsigned transaction output file")
+    _add_wallet_password_args(tx_build_offline)
+    tx_build_offline.set_defaults(func=cmd_tx_build_offline)
+
+    tx_sign_offline = subparsers.add_parser("tx-sign-offline", help="Sign unsigned transaction using local wallet key")
+    tx_sign_offline.add_argument("--tx-in", required=True, help="Unsigned transaction JSON")
+    tx_sign_offline.add_argument("--wallet", required=True, help="Signer wallet file")
+    tx_sign_offline.add_argument("--tx-out", default="signed_tx.json", help="Signed transaction output file")
+    _add_wallet_password_args(tx_sign_offline)
+    tx_sign_offline.set_defaults(func=cmd_tx_sign_offline)
+
+    tx_send_signed = subparsers.add_parser("tx-send-signed", help="Submit a pre-signed transaction")
+    tx_send_signed.add_argument("--tx", required=True, help="Signed transaction JSON")
+    tx_send_signed.add_argument("--data-dir", default="./data", help="Data directory for local mempool submission")
+    tx_send_signed.add_argument("--node", help="Optional node URL for direct network submission")
+    tx_send_signed.add_argument("--broadcast-node", help="Optional node URL to broadcast after local add")
+    tx_send_signed.add_argument("--broadcast-ttl", type=int, default=2, help="Forwarding hops for peers")
+    tx_send_signed.set_defaults(func=cmd_tx_send_signed)
+
+    seed_backup_challenge = subparsers.add_parser(
+        "seed-backup-challenge",
+        help="Generate random seed-word positions for backup checks",
+    )
+    seed_backup_challenge.add_argument("--wallet", required=True, help="Wallet file path")
+    seed_backup_challenge.add_argument("--count", type=int, default=3, help="Number of challenge positions")
+    _add_wallet_password_args(seed_backup_challenge)
+    seed_backup_challenge.set_defaults(func=cmd_seed_backup_challenge)
+
+    seed_backup_verify = subparsers.add_parser(
+        "seed-backup-verify",
+        help="Verify selected seed words against stored wallet mnemonic",
+    )
+    seed_backup_verify.add_argument("--wallet", required=True, help="Wallet file path")
+    seed_backup_verify.add_argument("--positions", required=True, help="Comma-separated 1-based positions, e.g. 2,7,11")
+    seed_backup_verify.add_argument("--words", required=True, help="Comma-separated seed words matching positions")
+    _add_wallet_password_args(seed_backup_verify)
+    seed_backup_verify.set_defaults(func=cmd_seed_backup_verify)
 
     chain_cmd = subparsers.add_parser("chain", help="Show blocks")
     chain_cmd.add_argument("--data-dir", default="./data", help="Data directory")
@@ -436,6 +797,7 @@ def build_parser() -> argparse.ArgumentParser:
     api_balance_source = api_balance_cmd.add_mutually_exclusive_group(required=True)
     api_balance_source.add_argument("--address", help="Address")
     api_balance_source.add_argument("--wallet", help="Wallet file")
+    _add_wallet_password_args(api_balance_cmd)
     api_balance_cmd.set_defaults(func=cmd_api_balance)
 
     api_chain_cmd = subparsers.add_parser("api-chain", help="Read chain rows via node REST API")
@@ -456,7 +818,25 @@ def build_parser() -> argparse.ArgumentParser:
     api_history_source = api_history_cmd.add_mutually_exclusive_group(required=True)
     api_history_source.add_argument("--address", help="Address")
     api_history_source.add_argument("--wallet", help="Wallet file")
+    _add_wallet_password_args(api_history_cmd)
     api_history_cmd.set_defaults(func=cmd_api_history)
+
+    api_nfts_cmd = subparsers.add_parser("api-nfts", help="Read NFT state via node REST API")
+    api_nfts_cmd.add_argument("--node", default="http://127.0.0.1:8844", help="Node URL")
+    api_nfts_cmd.add_argument("--token-id", help="Optional token id filter")
+    api_nfts_cmd.add_argument("--timeout", type=float, default=4.0, help="Request timeout in seconds")
+    api_nfts_cmd.set_defaults(func=cmd_api_nfts)
+
+    api_nft_listings_cmd = subparsers.add_parser("api-nft-listings", help="Read NFT listings via node REST API")
+    api_nft_listings_cmd.add_argument("--node", default="http://127.0.0.1:8844", help="Node URL")
+    api_nft_listings_cmd.add_argument("--timeout", type=float, default=4.0, help="Request timeout in seconds")
+    api_nft_listings_cmd.set_defaults(func=cmd_api_nft_listings)
+
+    api_contracts_cmd = subparsers.add_parser("api-contracts", help="Read smart contract state via node REST API")
+    api_contracts_cmd.add_argument("--node", default="http://127.0.0.1:8844", help="Node URL")
+    api_contracts_cmd.add_argument("--contract-id", help="Optional contract id filter")
+    api_contracts_cmd.add_argument("--timeout", type=float, default=4.0, help="Request timeout in seconds")
+    api_contracts_cmd.set_defaults(func=cmd_api_contracts)
 
     api_send_cmd = subparsers.add_parser("api-send", help="Create and broadcast tx through node REST API")
     api_send_cmd.add_argument("--node", default="http://127.0.0.1:8844", help="Node URL")
@@ -466,6 +846,7 @@ def build_parser() -> argparse.ArgumentParser:
     api_send_cmd.add_argument("--fee", type=int, help="Optional fee")
     api_send_cmd.add_argument("--broadcast-ttl", type=int, default=2, help="Forwarding hops for peers")
     api_send_cmd.add_argument("--timeout", type=float, default=6.0, help="Request timeout in seconds")
+    _add_wallet_password_args(api_send_cmd)
     api_send_cmd.set_defaults(func=cmd_api_send)
 
     api_mine_cmd = subparsers.add_parser("api-mine", help="Mine blocks through node REST API")
@@ -482,7 +863,25 @@ def build_parser() -> argparse.ArgumentParser:
     api_miner = api_mine_cmd.add_mutually_exclusive_group(required=True)
     api_miner.add_argument("--address", help="Miner address")
     api_miner.add_argument("--wallet", help="Miner wallet file")
+    _add_wallet_password_args(api_mine_cmd)
     api_mine_cmd.set_defaults(func=cmd_api_mine)
+
+    market_sync_cmd = subparsers.add_parser("market-sync", help="Sync marketplace index from node API")
+    market_sync_cmd.add_argument("--node", default="http://127.0.0.1:8844", help="Node URL")
+    market_sync_cmd.add_argument("--db", default="./market/market_index.db", help="SQLite index database path")
+    market_sync_cmd.add_argument("--timeout", type=float, default=4.0, help="Request timeout in seconds")
+    market_sync_cmd.set_defaults(func=cmd_market_sync)
+
+    market_run_cmd = subparsers.add_parser("market-run", help="Run marketplace web backend + frontend")
+    market_run_cmd.add_argument("--node", default="http://127.0.0.1:8844", help="Node URL")
+    market_run_cmd.add_argument("--db", default="./market/market_index.db", help="SQLite index database path")
+    market_run_cmd.add_argument("--host", default="127.0.0.1", help="Bind host")
+    market_run_cmd.add_argument("--port", type=int, default=8950, help="Bind port")
+    market_run_cmd.add_argument("--sync-interval", type=float, default=5.0, help="Background sync interval in seconds")
+    market_run_cmd.add_argument("--timeout", type=float, default=4.0, help="Node request timeout in seconds")
+    market_run_cmd.add_argument("--static-dir", help="Optional custom directory for web frontend assets")
+    market_run_cmd.add_argument("--no-auto-sync", action="store_true", help="Disable background auto-sync thread")
+    market_run_cmd.set_defaults(func=cmd_market_run)
 
     return parser
 

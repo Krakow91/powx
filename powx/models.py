@@ -59,6 +59,7 @@ class Transaction:
     nonce: int
     inputs: list[TxInput] = field(default_factory=list)
     outputs: list[TxOutput] = field(default_factory=list)
+    contract: dict[str, Any] | None = None
     txid: str = ""
 
     def to_dict(self, include_txid: bool = True) -> dict[str, Any]:
@@ -69,6 +70,8 @@ class Transaction:
             "inputs": [tx_in.to_dict() for tx_in in self.inputs],
             "outputs": [tx_out.to_dict() for tx_out in self.outputs],
         }
+        if self.contract is not None:
+            data["contract"] = self.contract
         if include_txid:
             data["txid"] = self.txid
         return data
@@ -81,6 +84,7 @@ class Transaction:
             nonce=int(data["nonce"]),
             inputs=[TxInput.from_dict(item) for item in data.get("inputs", [])],
             outputs=[TxOutput.from_dict(item) for item in data.get("outputs", [])],
+            contract=data.get("contract") if isinstance(data.get("contract"), dict) else None,
             txid=data.get("txid", ""),
         )
 
@@ -102,6 +106,8 @@ class Transaction:
             ],
             "outputs": [tx_out.to_dict() for tx_out in self.outputs],
         }
+        if self.contract is not None:
+            payload["contract"] = self.contract
         return canonical_json(payload).encode("utf-8")
 
     def signing_hash(self) -> bytes:

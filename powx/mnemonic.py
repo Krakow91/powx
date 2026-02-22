@@ -169,3 +169,56 @@ def private_key_from_backup_mnemonic(mnemonic: str) -> str:
         raise ValueError("Backup mnemonic checksum mismatch")
 
     return key_bytes.hex()
+
+
+def mnemonic_words(mnemonic: str) -> list[str]:
+    normalized = normalize_mnemonic(mnemonic)
+    words = normalized.split(" ")
+    if len(words) not in {WORDS_PER_MNEMONIC, BACKUP_WORDS_PER_MNEMONIC}:
+        raise ValueError(
+            f"Mnemonic must contain {WORDS_PER_MNEMONIC} words (new wallet) or "
+            f"{BACKUP_WORDS_PER_MNEMONIC} words (wallet backup)"
+        )
+    return words
+
+
+def backup_challenge_positions(mnemonic: str, count: int = 3) -> list[int]:
+    words = mnemonic_words(mnemonic)
+    if count <= 0:
+        raise ValueError("Backup challenge count must be positive")
+    if count > len(words):
+        raise ValueError("Backup challenge count exceeds mnemonic length")
+
+    indexes = list(range(1, len(words) + 1))
+    chosen = secrets.SystemRandom().sample(indexes, count)
+    chosen.sort()
+    return chosen
+
+
+def mnemonic_words_for_positions(mnemonic: str, positions: list[int]) -> list[str]:
+    words = mnemonic_words(mnemonic)
+    expected: list[str] = []
+    for position in positions:
+        if position <= 0 or position > len(words):
+            raise ValueError(f"Mnemonic position out of range: {position}")
+        expected.append(words[position - 1])
+    return expected
+
+
+def verify_backup_challenge(mnemonic: str, positions: list[int], provided_words: list[str]) -> bool:
+    if len(positions) != len(provided_words):
+        return False
+    try:
+        expected = mnemonic_words_for_positions(mnemonic, positions)
+    except ValueError:
+        return False
+
+    normalized_provided: list[str] = []
+    for word in provided_words:
+        normalized = normalize_mnemonic(word)
+        parts = normalized.split(" ") if normalized else []
+        if len(parts) != 1:
+            return False
+        normalized_provided.append(parts[0])
+
+    return expected == normalized_provided

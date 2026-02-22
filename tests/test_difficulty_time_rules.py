@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -16,6 +17,8 @@ ADDR_A = address_from_public_key(private_key_to_public_key(PRIV_A).hex(), "KK91"
 
 ASERT_TEST_CONFIG = replace(
     CONFIG,
+    consensus_lock_enabled=False,
+    chain_id="kk91-difficulty-test",
     target_schedule="asert-v3",
     initial_target=2**240,
     max_target=2**252,
@@ -28,6 +31,11 @@ ASERT_TEST_CONFIG = replace(
 
 
 class DifficultyTimeRulesTest(unittest.TestCase):
+    def test_empty_chain_uses_runtime_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            chain = Chain(td, config=ASERT_TEST_CONFIG)
+            self.assertEqual(chain.status()["target_schedule"], "asert-v3")
+
     def test_default_schedule_is_asert_for_new_chains(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             chain = Chain(td, config=ASERT_TEST_CONFIG)
@@ -103,6 +111,51 @@ class DifficultyTimeRulesTest(unittest.TestCase):
             reloaded.load()
             self.assertEqual(reloaded.status()["target_schedule"], "window-v2")
             self.assertEqual(reloaded.height, 1)
+
+    def test_load_migrates_bugged_genesis_only_window_state_to_asert(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            chain = Chain(td, config=ASERT_TEST_CONFIG)
+            with mock.patch.object(chain, "_now", return_value=1_700_000_000):
+                chain.initialize(ADDR_A, genesis_supply=0)
+
+            state_path = chain.state_path
+            with state_path.open("r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            raw["config"]["target_schedule"] = "window-v2"
+            with state_path.open("w", encoding="utf-8") as handle:
+                json.dump(raw, handle, indent=2)
+
+            reloaded = Chain(td, config=ASERT_TEST_CONFIG)
+            reloaded.load()
+            self.assertEqual(reloaded.status()["target_schedule"], "asert-v3")
+
+            with state_path.open("r", encoding="utf-8") as handle:
+                persisted = json.load(handle)
+            self.assertEqual(str(persisted.get("config", {}).get("target_schedule")), "asert-v3")
+
+    def test_load_infers_asert_when_state_omits_schedule_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            chain = Chain(td, config=ASERT_TEST_CONFIG)
+            with mock.patch.object(chain, "_now", return_value=1_700_000_000):
+                chain.initialize(ADDR_A, genesis_supply=0)
+            for timestamp in (1_700_000_015, 1_700_000_045, 1_700_000_105, 1_700_000_120):
+                with mock.patch.object(chain, "_now", return_value=timestamp):
+                    chain.mine_block(ADDR_A, mining_backend="cpu")
+
+            state_path = chain.state_path
+            with state_path.open("r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            raw_config = raw.get("config", {})
+            if isinstance(raw_config, dict):
+                raw_config.pop("target_schedule", None)
+                raw_config.pop("difficulty_window", None)
+            with state_path.open("w", encoding="utf-8") as handle:
+                json.dump(raw, handle, indent=2)
+
+            reloaded = Chain(td, config=ASERT_TEST_CONFIG)
+            reloaded.load()
+            self.assertEqual(reloaded.height, 4)
+            self.assertEqual(reloaded.status()["target_schedule"], "asert-v3")
 
 
 if __name__ == "__main__":

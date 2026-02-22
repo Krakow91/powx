@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import secrets
 import tempfile
 import unittest
@@ -22,6 +23,9 @@ ADDR_B = address_from_public_key(PUB_B, "KK91")
 
 FAST_MEMPOOL_CONFIG = replace(
     CONFIG,
+    consensus_lock_enabled=False,
+    chain_id="kk91-mempool-test",
+    coinbase_maturity=0,
     initial_target=2**255,
     max_target=2**255,
     max_adjust_factor_up=1.0,
@@ -97,7 +101,7 @@ class MempoolPolicyTest(unittest.TestCase):
             chain.initialize(ADDR_A, genesis_supply=0)
             self._mine_blocks(chain, 2)
 
-            parent = chain.create_transaction(PRIV_A, ADDR_B, amount=1, fee=1)
+            parent = chain.create_transaction(PRIV_A, ADDR_B, amount=2, fee=1)
             chain.add_transaction(parent)
 
             parent_change = int(parent.outputs[1].amount)
@@ -187,7 +191,7 @@ class MempoolPolicyTest(unittest.TestCase):
             chain.initialize(ADDR_A, genesis_supply=0)
             self._mine_blocks(chain, 4)
 
-            parent = chain.create_transaction(PRIV_A, ADDR_B, amount=1, fee=1)
+            parent = chain.create_transaction(PRIV_A, ADDR_B, amount=2, fee=1)
             chain.add_transaction(parent)
             child = _build_spend_tx(
                 chain,
@@ -208,6 +212,80 @@ class MempoolPolicyTest(unittest.TestCase):
             self.assertIn(parent.txid, mined_txids)
             self.assertIn(child.txid, mined_txids)
             self.assertNotIn(single.txid, mined_txids)
+
+    def test_coinbase_maturity_rejects_immature_spend(self) -> None:
+        cfg = replace(FAST_MEMPOOL_CONFIG, coinbase_maturity=5)
+        with tempfile.TemporaryDirectory() as td:
+            chain = Chain(td, config=cfg)
+            chain.initialize(ADDR_A, genesis_supply=0)
+            self._mine_blocks(chain, 1)
+
+            coinbase = chain.chain[-1].transactions[0]
+            amount = int(coinbase.outputs[0].amount)
+            spend = _build_spend_tx(
+                chain,
+                prev_txid=coinbase.txid,
+                prev_index=0,
+                prev_amount=amount,
+                fee=1,
+                to_address=ADDR_B,
+            )
+            with self.assertRaisesRegex(ValidationError, "immature"):
+                chain.validate_transaction(
+                    spend,
+                    copy.deepcopy(chain.utxos),
+                    for_mempool=True,
+                    block_height=max(0, chain.height + 1),
+                )
+
+    def test_dust_output_rejected_by_standard_policy(self) -> None:
+        cfg = replace(FAST_MEMPOOL_CONFIG, coinbase_maturity=0, min_dust_output=5)
+        with tempfile.TemporaryDirectory() as td:
+            chain = Chain(td, config=cfg)
+            chain.initialize(ADDR_A, genesis_supply=1_000)
+            genesis = chain.chain[0].transactions[0]
+            dust_tx = _build_spend_tx(
+                chain,
+                prev_txid=genesis.txid,
+                prev_index=0,
+                prev_amount=1_000,
+                fee=999,
+                to_address=ADDR_B,
+            )
+            with self.assertRaisesRegex(ValidationError, "Dust output"):
+                chain.validate_transaction(
+                    dust_tx,
+                    copy.deepcopy(chain.utxos),
+                    for_mempool=True,
+                    block_height=1,
+                )
+
+    def test_non_standard_pubkey_rejected_by_mempool_policy(self) -> None:
+        cfg = replace(FAST_MEMPOOL_CONFIG, coinbase_maturity=0)
+        with tempfile.TemporaryDirectory() as td:
+            chain = Chain(td, config=cfg)
+            chain.initialize(ADDR_A, genesis_supply=1_000)
+
+            genesis = chain.chain[0].transactions[0]
+            bad_pubkey = "04" + ("11" * 64)
+            tx = Transaction(
+                version=chain.tx_version_for_height(1),
+                timestamp=chain._now(),
+                nonce=secrets.randbits(64),
+                inputs=[TxInput(txid=genesis.txid, index=0, pubkey=bad_pubkey)],
+                outputs=[TxOutput(amount=999, address=ADDR_B)],
+            )
+            sighash = tx.signing_hash()
+            tx.inputs[0].signature = sign_digest(PRIV_A, sighash)
+            tx.txid = tx.compute_txid()
+
+            with self.assertRaisesRegex(ValidationError, "Non-standard pubkey"):
+                chain.validate_transaction(
+                    tx,
+                    copy.deepcopy(chain.utxos),
+                    for_mempool=True,
+                    block_height=1,
+                )
 
 
 if __name__ == "__main__":

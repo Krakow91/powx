@@ -1,10 +1,10 @@
 ﻿# KK91 - Fast Proof-of-Work Crypto Prototype
 
-KK91 ist ein **Bitcoin-inspirierter PoW-Prototyp** mit Fokus auf schnellere Bestätigungen und zusätzliche Sicherheitsregeln.
+KK91 ist ein **PoW-Prototyp** mit Fokus auf schnellere Bestätigungen und zusätzliche Sicherheitsregeln.
 
 Wichtig: Das ist ein Lern-/Demo-Projekt, **kein production-ready Mainnet**.
 
-## Was ist schneller/sicherer als Bitcoin (im Prototyp)
+## Was ist schneller/sicherer (im Prototyp)
 
 - Schnellere Ziel-Blockzeit: `30s` statt ~10 Minuten
 - Dynamische Difficulty pro Block mit begrenzten Anpassungen
@@ -20,19 +20,22 @@ Wichtig: Das ist ein Lern-/Demo-Projekt, **kein production-ready Mainnet**.
 - Python 3.11+ (3.10 sollte ebenfalls funktionieren)
 - Fuer GPU-Mining: OpenCL-Treiber + `pyopencl` + `numpy`
 - Fuer QR in Wallet-UI: `qrcode` + `Pillow`
+- Optional fuer Argon2-Wallet-KDF: `argon2-cffi`
 
 Installation (optional fuer GPU):
 
 ```bash
 python -m pip install numpy pyopencl
 python -m pip install qrcode Pillow
+python -m pip install argon2-cffi
 ```
 
 ## Schnellstart
 
 ```bash
 cd "d:\Projekt X\powx"
-python powx_cli.py wallet-new --out alice.json
+set WALLET_PASS=dein_starkes_passwort
+python powx_cli.py wallet-new --out alice.json --wallet-password-env WALLET_PASS
 python powx_cli.py init --data-dir ./data --genesis-wallet alice.json --genesis-supply 0
 python powx_cli.py status --data-dir ./data
 python powx_cli.py mine --data-dir ./data --wallet alice.json --blocks 2 --backend auto
@@ -89,9 +92,11 @@ python kk91_wallet_ui.py
 ```
 
 Was die Wallet-GUI kann:
-- Wallet erstellen/laden und Einstellungen speichern (`wallet_ui_settings.json`)
+- Wallet erstellen/laden, locken/entsperren und Einstellungen speichern (`wallet_ui_settings.json`)
+- Verschluesselte Wallet-Dateien (standardmaessig) mit KDF (`scrypt`, optional `argon2id`)
 - Seed-Wallet erstellen (12-Wort Seed Phrase) und Wallet aus Seed wiederherstellen
 - Backup-Seed fuer bestehende Wallet erzeugen (24-Wort) und daraus wiederherstellen
+- Seed-Backup-Check (Challenge mit Positionsabfrage) zur Sicherungsvalidierung
 - Seed Phrase anzeigen/kopieren fuer Backup
 - Kontostand, Blockhoehe und Mempool live anzeigen
 - Coins senden (Empfaenger, Betrag, Fee)
@@ -156,9 +161,13 @@ Die Node stellt REST-Endpunkte bereit, damit Wallet/Mining nicht nur dateibasier
 - `GET /api/v1/chain?limit=20`
 - `GET /api/v1/mempool`
 - `GET /api/v1/history?address=<ADDR>&limit=120`
-- `POST /api/v1/tx/create` (signiert + broadcastet Tx auf Node)
+- `POST /api/v1/tx/build` (unsigned Tx-Template vom Node)
+- `POST /api/v1/tx/submit` (signed Tx submit + broadcast)
 - `POST /api/v1/mine` (mine auf Node)
 - `POST /api/v1/mempool/prune`
+
+Hinweis:
+- `POST /api/v1/tx/create` ist aus Sicherheitsgruenden deprecated (private keys nie an Nodes senden).
 
 Zusatz in Schritt 3 (Härtung):
 - HTTP Rate-Limit pro Client (429 bei Überschreitung)
@@ -211,7 +220,7 @@ Weitere `node-run` Optionen:
 
 ## P2P Relay + Robustness (Schritt 6)
 
-Neue Gossip-Semantik (Bitcoin-aehnlich):
+Neue Gossip-Semantik:
 - `POST /inv` kuendigt nur Inventar (`txid`/`block hash`) an
 - `POST /getdata` liefert Full-Payload nur auf Anforderung
 - Fallback auf `/tx` und `/block` bleibt fuer Kompatibilitaet aktiv
@@ -242,10 +251,53 @@ python powx_cli.py api-balance --node http://127.0.0.1:8844 --address <ADDR>
 python powx_cli.py api-chain --node http://127.0.0.1:8844 --limit 20
 python powx_cli.py api-mempool --node http://127.0.0.1:8844
 python powx_cli.py api-history --node http://127.0.0.1:8844 --address <ADDR> --limit 50
+# api-send signiert jetzt lokal (offline) und sendet nur die signed Tx
 python powx_cli.py api-send --node http://127.0.0.1:8844 --wallet alice.json --to <ADDR> --amount 7 --fee 1
 python powx_cli.py api-mine --node http://127.0.0.1:8844 --wallet alice.json --blocks 1 --backend auto
 # optional bei sehr langsamem Mining: --timeout 180
 # oder ohne Limit (Standard): --timeout 0
+```
+
+Expliziter Offline-Flow:
+
+```bash
+python powx_cli.py tx-build-offline --data-dir ./data --from-wallet alice.json --to <ADDR> --amount 7 --fee 1 --out unsigned.json
+python powx_cli.py tx-sign-offline --tx-in unsigned.json --wallet alice.json --tx-out signed.json
+python powx_cli.py tx-send-signed --node http://127.0.0.1:8844 --tx signed.json
+```
+
+## Wallet- und Key-Sicherheit
+
+- Wallet-Dateien koennen verschluesselt gespeichert werden (`scrypt`, optional `argon2id`)
+- Seed-Backup-Checks sind via CLI und Wallet-UI verfuegbar
+- API-Transaktionsflow ist auf `build -> local sign -> submit` gehaertet
+- Private Keys sollen die Wallet nie verlassen
+
+CLI-Beispiele:
+
+```bash
+python powx_cli.py wallet-new --out alice.json --wallet-password-prompt
+python powx_cli.py seed-backup-challenge --wallet alice.json --wallet-password-prompt --count 3
+python powx_cli.py seed-backup-verify --wallet alice.json --wallet-password-prompt --positions 2,7,11 --words word2,word7,word11
+```
+
+## Soak-Test (Multi-Node)
+
+```bash
+cd "d:\Projekt X\powx"
+python tools/soak_network.py --root-dir ./soak_run --nodes 3 --duration-seconds 3600 --backend cpu
+```
+
+## Mainnet Freeze
+
+Checkliste:
+- `docs/MAINNET_FREEZE_CHECKLIST.md`
+
+Freeze-Snapshot erzeugen:
+
+```bash
+cd "d:\Projekt X\powx"
+python tools/mainnet_freeze_snapshot.py --data-dir ./data --out ./docs/mainnet_freeze_snapshot.json
 ```
 
 ## Difficulty + Time Hardening (Schritt 7)
@@ -283,14 +335,75 @@ Neue relevante Config-Felder:
 - `min_rbf_fee_delta`
 - `min_rbf_feerate_delta`
 
+## NFT + Smart Contracts (Schritt 9)
+
+- Deterministische On-Chain-Contract-Payloads in Transaktionen (`contract`-Feld).
+- NFT-Marktplatz-Logik als native Contract-Aktionen:
+- `kind=nft, action=mint|list|cancel|buy`
+- Kauf (`buy`) erzwingt on-chain Zahlung an den gelisteten Seller.
+- Einfache Smart-Contracts als Template-System:
+- `kind=sc, action=deploy|call`, Template `kv_v1` (Owner-verwalteter Key/Value-State).
+- Contract-/NFT-States werden beim Chain-Load aus den Blöcken rekonstruiert und in `chain_state.json` persistiert.
+
+Neue relevante Config-Felder:
+- `smart_contracts_enabled`
+- `nft_market_enabled`
+- `max_contract_payload_bytes`
+- `max_contract_kv_entries`
+- `max_contract_key_bytes`
+- `max_contract_value_bytes`
+
+Neue API-Endpunkte:
+- `GET /api/v1/nfts[?token_id=...]`
+- `GET /api/v1/nft/listings`
+- `GET /api/v1/contracts[?contract_id=...]`
+- `POST /api/v1/tx/build-contract` (unsigned Contract-TX fuer Offline-Signing)
+
+## Web Marketplace Stack (Schritt 10)
+
+Schritt 10 bringt die drei Web-Bausteine fuer NFT/Contract-Apps:
+
+- Indexer: SQLite Read-Model (`market_index.db`) fuer NFTs, Listings, Contracts
+- Web-Backend: eigener Service mit API fuer Explorer/Filter + Build/Submit-Flows
+- Frontend: modernes Dashboard (cyberpunk Stil), direkt vom Backend ausgeliefert
+- Creator Studio im Frontend: Mint, List, Cancel und Buy mit Local-Signer-Flow
+
+CLI:
+
+```bash
+# Einmalig aus Node-API in SQLite indexen
+python powx_cli.py market-sync --node http://127.0.0.1:8844 --db ./market/market_index.db
+
+# Komplettes Web-Stack starten (Indexer + Backend + Frontend)
+python powx_cli.py market-run --node http://127.0.0.1:8844 --db ./market/market_index.db --host 127.0.0.1 --port 8950
+```
+
+Dann im Browser:
+- `http://127.0.0.1:8950/`
+
+Marketplace-Backend-API:
+- `GET /api/v1/market/status`
+- `GET /api/v1/market/nfts?owner=...&listed=true|false&search=...`
+- `GET /api/v1/market/listings?seller=...`
+- `GET /api/v1/market/contracts?owner=...&template=...&contract_id=...`
+- `POST /api/v1/market/sync`
+- `POST /api/v1/market/build-contract` (unsigned tx template via node)
+- `POST /api/v1/market/submit-signed` (signed tx submit via node)
+- `POST /api/v1/market/submit-contract` (build + local sign + submit in einem Schritt)
+
 ## Befehle
 
-- `wallet-new --out <file>`
+- `wallet-new --out <file> [--seed] [--encrypt|--no-encrypt] [--kdf scrypt|argon2id] [--wallet-password ...]`
 - `wallet-address --wallet <file>`
+- `seed-backup-challenge --wallet <file> --count N [--wallet-password ...]`
+- `seed-backup-verify --wallet <file> --positions <csv> --words <csv> [--wallet-password ...]`
 - `init --data-dir <dir> [--genesis-wallet <file> | --genesis-address <addr>] [--genesis-supply N]`
 - `status --data-dir <dir>`
 - `balance --data-dir <dir> (--wallet <file> | --address <addr>)`
 - `send --data-dir <dir> --wallet <file> --to <addr> --amount N [--fee N] [--broadcast-node <url>]`
+- `tx-build-offline --data-dir <dir> (--from-wallet <file> | --from-pubkey <hex>) --to <addr> --amount N [--fee N] --out <file>`
+- `tx-sign-offline --tx-in <file> --wallet <file> --tx-out <file>`
+- `tx-send-signed --tx <file> [--data-dir <dir>] [--node <url>] [--broadcast-node <url>]`
 - `mine --data-dir <dir> (--wallet <file> | --address <addr>) [--blocks N] [--backend auto|gpu|cpu] [--broadcast-node <url>]`
 - `mempool --data-dir <dir>`
 - `chain --data-dir <dir> [--limit N]`
@@ -303,18 +416,26 @@ Neue relevante Config-Felder:
 - `api-chain --node <url> [--limit N]`
 - `api-mempool --node <url>`
 - `api-history --node <url> (--address <addr> | --wallet <file>) [--limit N]`
+- `api-nfts --node <url> [--token-id <id>]`
+- `api-nft-listings --node <url>`
+- `api-contracts --node <url> [--contract-id <id>]`
 - `api-send --node <url> --wallet <file> --to <addr> --amount N [--fee N]`
 - `api-mine --node <url> (--wallet <file> | --address <addr>) [--blocks N] [--backend auto|gpu|cpu] [--timeout S]`
+- `market-sync --node <url> [--db <path>]`
+- `market-run --node <url> [--db <path>] [--host <host>] [--port <port>] [--sync-interval S] [--timeout S] [--static-dir <dir>] [--no-auto-sync]`
 
 ## Hinweise
 
-- Keys liegen unverschlüsselt in JSON-Dateien. Für echte Sicherheit: Hardware Wallet/HSM, Verschlüsselung, Key-Rotation.
+- Wallet-Verschluesselung ist verfuegbar; fuer Mainnet trotzdem HSM/Hardware-Wallet, Key-Rotation und strikte OPSEC einplanen.
 - P2P bleibt HTTP-basiert, nutzt aber jetzt Header-First-Sync plus `inv/getdata`, Orphan-Handling und diversifizierte Outbound-Peer-Auswahl.
 - Schritt 3 reduziert DoS-Risiken deutlich (Rate-Limit, Request-Size-Limit, TTL-Cap, Peer-Limit, Sync-Retry-Cooldown).
 - Schritt 4 + 5 bringen Peer-Scoring/Temp-Ban, signierte Peer-Messages und persistente Reputationsdaten; fuer ein echtes Mainnet fehlen trotzdem noch robustere Anti-Sybil-/Peer-Discovery-/Reputation-Mechanismen.
 - Die Chain validiert beim Laden den gesamten Blockverlauf neu und rekonstruiert UTXOs aus den Blöcken (State-Härtung gegen manipulierte Dateien).
 - Aeltere `chain_state.json`-Dateien werden kompatibel erkannt (Legacy-Target-Schedule), damit bestehende lokale KK91-Daten weiter nutzbar bleiben.
-- Bitcoin-aehnliche Geldpolitik ist aktiv: Halving (`halving_interval=210000`) + feste Obergrenze (`max_total_supply=911000000`).
+- Geldpolitik mit Halving (`halving_interval=210000`) + feste Obergrenze (`max_total_supply=911000000`) ist aktiv.
+- Tokenomics-Kalibrierung: `initial_block_reward=2173` erzeugt theoretisch `911190000` Subsidy; die letzten `190000` werden durch den Supply-Cap abgeschnitten, sodass exakt `911000000` erreicht werden.
+- Mainnet-Konsens ist eingefroren (`consensus_lock_enabled=true`): `target_schedule=asert-v3` ist Pflicht, `chain_id` ist exakt fixiert und die Genesis ist ueber festen Hash/Nonce/Adresse/Supply gebunden.
+- Upgrade-Hoehe ist explizit festgelegt: `protocol_upgrade_v2_height=840000`.
 - Standard fuer `init` ist `--genesis-supply 0` (kein Premine). Wenn du einen Premine setzt, wird der Rest fuer Mining entsprechend kleiner.
 - Schritt 1 umgesetzt: Upgrade-Framework mit `protocol_version` und `protocol_upgrade_v2_height` (Status zeigt aktive/naechste Protokollversion).
 - Neue Blöcke mit zu weit in der Zukunft liegenden Timestamps werden abgelehnt (`max_future_block_seconds`).
