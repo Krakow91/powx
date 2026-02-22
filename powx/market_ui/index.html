@@ -1,0 +1,187 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>KK91 Market Hub</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <main class="shell">
+    <header class="topbar card">
+      <div>
+        <p class="eyebrow">KK91</p>
+        <h1>Market Hub</h1>
+      </div>
+      <div class="topbar-actions">
+        <button id="syncNowBtn" class="btn btn-ghost">Sync now</button>
+        <button id="refreshBtn" class="btn btn-primary">Refresh view</button>
+      </div>
+    </header>
+
+    <section class="status-grid">
+      <article class="card stat">
+        <p>Node</p>
+        <strong id="nodeUrl">-</strong>
+      </article>
+      <article class="card stat">
+        <p>Synced height</p>
+        <strong id="syncedHeight">-</strong>
+      </article>
+      <article class="card stat">
+        <p>NFTs</p>
+        <strong id="nftCount">0</strong>
+      </article>
+      <article class="card stat">
+        <p>Listings</p>
+        <strong id="listingCount">0</strong>
+      </article>
+      <article class="card stat">
+        <p>Contracts</p>
+        <strong id="contractCount">0</strong>
+      </article>
+      <article class="card stat">
+        <p>Last sync</p>
+        <strong id="lastSync">never</strong>
+      </article>
+    </section>
+
+    <section class="card signer">
+      <h2>Creator Access</h2>
+      <p class="muted">Der private Key wird nur im Browser gehalten und nicht gespeichert. Nur lokal verwenden.</p>
+      <div class="signer-grid">
+        <div class="with-button">
+          <input id="signerPrivateKey" class="input" type="password" placeholder="Private key (64 hex)" autocomplete="off" />
+          <button id="toggleSignerKeyBtn" class="btn btn-ghost" type="button">Show</button>
+        </div>
+        <input id="signerFee" class="input" placeholder="Fee (default 2)" />
+        <input id="signerTtl" class="input" placeholder="Broadcast TTL (default 2)" />
+      </div>
+    </section>
+
+    <section class="studio-grid">
+      <article class="card pane" id="mintStudio">
+        <h2>Create NFT</h2>
+        <p class="muted">Mint direkt on-chain als `kind=nft, action=mint`.</p>
+        <div class="form-grid">
+          <input id="mintTokenId" class="input" placeholder="Token ID (z.B. ART-901)" />
+          <input id="mintMetadata" class="input" placeholder="Metadata URI (ipfs://...)" />
+          <input id="mintOwner" class="input" placeholder="Owner-Adresse (optional)" />
+        </div>
+        <div class="form-actions">
+          <button id="mintBtn" class="btn btn-primary">Mint NFT</button>
+        </div>
+      </article>
+
+      <article class="card pane" id="listingStudio">
+        <h2>Marketplace Actions</h2>
+        <p class="muted">List, Cancel und Buy mit einem Klick.</p>
+
+        <div class="action-block">
+          <h3>List NFT</h3>
+          <div class="form-grid two">
+            <input id="listTokenId" class="input" placeholder="Token ID" />
+            <input id="listPrice" class="input" placeholder="Price in KK91" />
+          </div>
+          <button id="listBtn" class="btn btn-primary">List NFT</button>
+        </div>
+
+        <div class="action-block">
+          <h3>Cancel Listing</h3>
+          <div class="form-grid one">
+            <input id="cancelTokenId" class="input" placeholder="Token ID" />
+          </div>
+          <button id="cancelBtn" class="btn btn-ghost">Cancel Listing</button>
+        </div>
+
+        <div class="action-block">
+          <h3>Buy NFT</h3>
+          <div class="form-grid three">
+            <input id="buyTokenId" class="input" placeholder="Token ID" />
+            <input id="buySeller" class="input" placeholder="Seller address" />
+            <input id="buyPrice" class="input" placeholder="Price in KK91" />
+          </div>
+          <button id="buyBtn" class="btn btn-primary">Buy NFT</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="card controls">
+      <h2>NFT Explorer</h2>
+      <div class="control-row">
+        <input id="ownerFilter" class="input" placeholder="Owner address (optional)" />
+        <input id="searchFilter" class="input" placeholder="Search token id or metadata" />
+        <select id="listedFilter" class="input">
+          <option value="">All</option>
+          <option value="true">Listed only</option>
+          <option value="false">Unlisted only</option>
+        </select>
+        <button id="applyFilterBtn" class="btn btn-primary">Apply</button>
+      </div>
+      <div id="nftGrid" class="nft-grid"></div>
+    </section>
+
+    <section class="split">
+      <article class="card pane">
+        <h2>Active Listings</h2>
+        <div id="listingTable" class="table"></div>
+      </article>
+      <article class="card pane">
+        <h2>Smart Contracts</h2>
+        <div id="contractTable" class="table"></div>
+      </article>
+    </section>
+
+    <section class="card activity">
+      <h2>Activity Log</h2>
+      <textarea id="actionOutput" class="textarea" rows="8" readonly></textarea>
+    </section>
+
+    <details class="card advanced">
+      <summary>Advanced Tools (unsigned/signed tx)</summary>
+      <div class="advanced-inner">
+        <h3>Build unsigned contract transaction</h3>
+        <div class="builder-grid">
+          <input id="senderPubkey" class="input" placeholder="Sender public key (hex)" />
+          <input id="toAddress" class="input" placeholder="to_address (optional)" />
+          <input id="amount" class="input" placeholder="amount (optional)" />
+          <input id="fee" class="input" placeholder="fee (optional)" />
+        </div>
+        <label for="contractPayload" class="muted">Contract payload JSON</label>
+        <textarea id="contractPayload" class="textarea" rows="8">{
+  "kind": "nft",
+  "action": "mint",
+  "token_id": "ART-001",
+  "metadata_uri": "ipfs://example"
+}</textarea>
+        <div class="builder-actions">
+          <button id="buildUnsignedBtn" class="btn btn-primary">Build unsigned tx</button>
+        </div>
+        <label for="unsignedOutput" class="muted">Unsigned transaction result</label>
+        <textarea id="unsignedOutput" class="textarea" rows="8" readonly></textarea>
+
+        <h3>Submit signed transaction</h3>
+        <textarea id="signedInput" class="textarea" rows="8" placeholder='{"version":2,"inputs":[],"outputs":[],"txid":"..."}'></textarea>
+        <div class="builder-grid one">
+          <input id="broadcastTtl" class="input" placeholder="broadcast ttl (default 2)" />
+        </div>
+        <div class="builder-actions">
+          <button id="submitSignedBtn" class="btn btn-primary">Submit signed tx</button>
+        </div>
+        <label for="submitOutput" class="muted">Submit response</label>
+        <textarea id="submitOutput" class="textarea" rows="6" readonly></textarea>
+      </div>
+    </details>
+
+    <footer class="foot">
+      <span id="errorLine" class="error-line"></span>
+    </footer>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

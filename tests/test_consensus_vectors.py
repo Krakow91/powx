@@ -21,8 +21,8 @@ ADDR_B = address_from_public_key(PUB_B, "KK91")
 
 VECTOR_GENESIS_HASH = "00000330c8fe2065d8f358842cee842734c98e6ce46d302440db095297252160"
 VECTOR_GENESIS_TXID = "90ed3f83e3e35b517af2ec9116bba8296d51be31b8a57462cf92e23de2a8c008"
-VECTOR_B1_HASH = "000008428f9991b22ff35a32009a2ef9b157fd715ab0e86853af0ca5af5303bb"
-VECTOR_B1_TXID = "c97e720ce8d5bf9751b4d0bc505b8feceb920cc672b5d175f3e9b21bd3b1649a"
+VECTOR_B1_HASH = "000062242a22cb4bf73e2e98c335039d7247888cd3d0c3e017ccf50eb2f1420f"
+VECTOR_B1_TXID = "4cd9f90c162e3ba5b0b063340e6d6685dca3fca0aa0a49d575b4ac4c3035e9f0"
 VECTOR_B1_TARGET = 1766847064778384329583297500742918515827483896875618958121606201292619776
 VECTOR_B1_CHAIN_WORK = 131070
 
@@ -32,6 +32,8 @@ VECTOR_TX_SIGHASH = "2670f838a3601a10000d54777c7e22530723d3ec25364c250654a08bfea
 
 FAST_POLICY_CONFIG = replace(
     CONFIG,
+    consensus_lock_enabled=False,
+    chain_id="kk91-vectors-fast",
     initial_target=2**255,
     max_target=2**255,
     max_adjust_factor_up=1.0,
@@ -149,6 +151,19 @@ class ConsensusVectorsTest(unittest.TestCase):
             self.assertEqual(rewards, [50, 25, 25, 12, 8, 0])
             self.assertEqual(chain.issued_supply(), 120)
             self.assertEqual(chain.status()["remaining_supply"], 0)
+
+    def test_default_tokenomics_calibration_vector(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            chain = Chain(td)
+            halving_interval = int(chain.config.halving_interval)
+            theoretical_uncapped = halving_interval * sum(
+                chain.config.initial_block_reward >> era for era in range(64)
+            )
+
+            self.assertEqual(chain.config.max_total_supply, 911_000_000)
+            self.assertEqual(chain.config.initial_block_reward, 2_173)
+            self.assertEqual(theoretical_uncapped, 911_190_000)
+            self.assertEqual(theoretical_uncapped - chain.config.max_total_supply, 190_000)
 
     def test_reorg_depth_limit_vector(self) -> None:
         cfg = replace(FAST_POLICY_CONFIG, max_reorg_depth=1)

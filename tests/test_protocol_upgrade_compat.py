@@ -20,6 +20,9 @@ ADDR_B = address_from_public_key(private_key_to_public_key(PRIV_B).hex(), "KK91"
 
 FAST_UPGRADE_CONFIG = replace(
     CONFIG,
+    consensus_lock_enabled=False,
+    chain_id="kk91-upgrade-test",
+    coinbase_maturity=0,
     initial_target=2**255,
     max_target=2**255,
     max_adjust_factor_up=1.0,
@@ -54,7 +57,7 @@ class ProtocolUpgradeCompatTest(unittest.TestCase):
             chain.initialize(ADDR_A, genesis_supply=0)
             chain.mine_block(ADDR_A, mining_backend="cpu")
 
-            tx_v2 = chain.create_transaction(PRIV_A, ADDR_B, amount=1, fee=1)
+            tx_v2 = chain.create_transaction(PRIV_A, ADDR_B, amount=2, fee=1)
             self.assertEqual(tx_v2.version, 2)
 
             fee = chain.validate_transaction(
@@ -103,6 +106,9 @@ class ProtocolUpgradeCompatTest(unittest.TestCase):
 
             runtime_config = replace(
                 CONFIG,
+                consensus_lock_enabled=False,
+                chain_id="kk91-upgrade-test",
+                coinbase_maturity=0,
                 initial_target=2**255,
                 max_target=2**255,
                 max_adjust_factor_up=1.0,

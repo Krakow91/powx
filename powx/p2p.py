@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .chain import Chain, ValidationError
+from .config import ChainConfig
 from .crypto import generate_private_key_hex, private_key_to_public_key, sign_digest, verify_signature
 from .models import Block, Transaction
 
@@ -109,6 +111,26 @@ def api_history(node_url: str, address: str, limit: int = 120, timeout: float = 
     )
 
 
+def api_nfts(node_url: str, token_id: str | None = None, timeout: float = 4.0) -> dict[str, Any]:
+    if token_id:
+        return _request_json(_join_url(node_url, f"/api/v1/nfts?token_id={token_id}"), method="GET", timeout=timeout)
+    return _request_json(_join_url(node_url, "/api/v1/nfts"), method="GET", timeout=timeout)
+
+
+def api_nft_listings(node_url: str, timeout: float = 4.0) -> dict[str, Any]:
+    return _request_json(_join_url(node_url, "/api/v1/nft/listings"), method="GET", timeout=timeout)
+
+
+def api_contracts(node_url: str, contract_id: str | None = None, timeout: float = 4.0) -> dict[str, Any]:
+    if contract_id:
+        return _request_json(
+            _join_url(node_url, f"/api/v1/contracts?contract_id={contract_id}"),
+            method="GET",
+            timeout=timeout,
+        )
+    return _request_json(_join_url(node_url, "/api/v1/contracts"), method="GET", timeout=timeout)
+
+
 def api_create_transaction(
     node_url: str,
     private_key_hex: str,
@@ -118,15 +140,163 @@ def api_create_transaction(
     broadcast_ttl: int = 2,
     timeout: float = 6.0,
 ) -> dict[str, Any]:
+    # Security hardening: keep private key client-side.
+    try:
+        sender_pubkey = private_key_to_public_key(private_key_hex).hex()
+    except Exception as exc:
+        raise NetworkError(f"Invalid private key: {exc}") from exc
+    build_result = api_build_transaction(
+        node_url=node_url,
+        sender_pubkey=sender_pubkey,
+        to_address=to_address,
+        amount=amount,
+        fee=fee,
+        timeout=timeout,
+    )
+
+    tx_raw = build_result.get("tx")
+    if not isinstance(tx_raw, dict):
+        raise NetworkError("Node response missing transaction template")
+    try:
+        unsigned_tx = Transaction.from_dict(tx_raw)
+    except Exception as exc:
+        raise NetworkError(f"Node returned invalid transaction template: {exc}") from exc
+    signed_tx = sign_transaction_offline(unsigned_tx, private_key_hex=private_key_hex)
+    return api_submit_transaction(
+        node_url=node_url,
+        tx=signed_tx,
+        broadcast_ttl=broadcast_ttl,
+        timeout=timeout,
+    )
+
+
+def api_build_contract_transaction(
+    node_url: str,
+    sender_pubkey: str,
+    contract_payload: dict[str, Any],
+    fee: int | None = None,
+    to_address: str | None = None,
+    amount: int | None = None,
+    timeout: float = 6.0,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "private_key_hex": private_key_hex,
-        "to_address": to_address,
-        "amount": int(amount),
-        "broadcast_ttl": int(broadcast_ttl),
+        "sender_pubkey": str(sender_pubkey).strip().lower(),
+        "contract": contract_payload,
     }
     if fee is not None:
         payload["fee"] = int(fee)
-    return _request_json(_join_url(node_url, "/api/v1/tx/create"), method="POST", payload=payload, timeout=timeout)
+    if to_address is not None:
+        payload["to_address"] = str(to_address)
+    if amount is not None:
+        payload["amount"] = int(amount)
+    return _request_json(
+        _join_url(node_url, "/api/v1/tx/build-contract"),
+        method="POST",
+        payload=payload,
+        timeout=timeout,
+    )
+
+
+def api_create_contract_transaction(
+    node_url: str,
+    private_key_hex: str,
+    contract_payload: dict[str, Any],
+    fee: int | None = None,
+    to_address: str | None = None,
+    amount: int | None = None,
+    broadcast_ttl: int = 2,
+    timeout: float = 6.0,
+) -> dict[str, Any]:
+    try:
+        sender_pubkey = private_key_to_public_key(private_key_hex).hex()
+    except Exception as exc:
+        raise NetworkError(f"Invalid private key: {exc}") from exc
+
+    build_result = api_build_contract_transaction(
+        node_url=node_url,
+        sender_pubkey=sender_pubkey,
+        contract_payload=contract_payload,
+        fee=fee,
+        to_address=to_address,
+        amount=amount,
+        timeout=timeout,
+    )
+    tx_raw = build_result.get("tx")
+    if not isinstance(tx_raw, dict):
+        raise NetworkError("Node response missing contract transaction template")
+    try:
+        unsigned_tx = Transaction.from_dict(tx_raw)
+    except Exception as exc:
+        raise NetworkError(f"Node returned invalid contract transaction template: {exc}") from exc
+
+    signed_tx = sign_transaction_offline(unsigned_tx, private_key_hex=private_key_hex)
+    submit_result = api_submit_transaction(
+        node_url=node_url,
+        tx=signed_tx,
+        broadcast_ttl=broadcast_ttl,
+        timeout=timeout,
+    )
+    return {
+        "ok": bool(submit_result.get("ok", True)),
+        "txid": signed_tx.txid,
+        "submit": submit_result,
+    }
+
+
+def api_build_transaction(
+    node_url: str,
+    sender_pubkey: str,
+    to_address: str,
+    amount: int,
+    fee: int | None = None,
+    timeout: float = 6.0,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "sender_pubkey": str(sender_pubkey).strip().lower(),
+        "to_address": to_address,
+        "amount": int(amount),
+    }
+    if fee is not None:
+        payload["fee"] = int(fee)
+    return _request_json(_join_url(node_url, "/api/v1/tx/build"), method="POST", payload=payload, timeout=timeout)
+
+
+def api_submit_transaction(
+    node_url: str,
+    tx: Transaction,
+    broadcast_ttl: int = 2,
+    timeout: float = 6.0,
+) -> dict[str, Any]:
+    return _request_json(
+        _join_url(node_url, "/api/v1/tx/submit"),
+        method="POST",
+        payload={"tx": tx.to_dict(), "broadcast_ttl": int(broadcast_ttl)},
+        timeout=timeout,
+    )
+
+
+def sign_transaction_offline(tx: Transaction, private_key_hex: str) -> Transaction:
+    if tx.is_coinbase():
+        raise NetworkError("Coinbase transaction cannot be signed")
+    if len(tx.inputs) == 0:
+        raise NetworkError("Transaction requires at least one input")
+
+    try:
+        signer_pubkey = private_key_to_public_key(private_key_hex).hex()
+    except Exception as exc:
+        raise NetworkError(f"Invalid private key: {exc}") from exc
+    signed_tx = Transaction.from_dict(tx.to_dict())
+    for tx_input in signed_tx.inputs:
+        existing_pubkey = tx_input.pubkey.strip().lower()
+        if existing_pubkey and existing_pubkey != signer_pubkey:
+            raise NetworkError("Private key does not match transaction input pubkey")
+        tx_input.pubkey = signer_pubkey
+
+    sighash = signed_tx.signing_hash()
+    for tx_input in signed_tx.inputs:
+        tx_input.signature = sign_digest(private_key_hex, sighash)
+    signed_tx.txid = signed_tx.compute_txid()
+    return signed_tx
 
 
 def api_mine(
@@ -204,8 +374,19 @@ class P2PNode:
         peer_reward_success: int = 3,
         peer_auth_max_skew_seconds: int = 120,
         peer_auth_replay_window_seconds: int = 180,
+        max_inv_items: int = 256,
+        max_getdata_items: int = 128,
+        max_orphan_blocks: int = 2048,
+        orphan_ttl_seconds: int = 1800,
+        max_outbound_broadcast_peers: int = 16,
+        max_outbound_sync_peers: int = 32,
+        max_outbound_peers_per_bucket: int = 2,
+        bootnodes: list[str] | None = None,
+        peer_ping_interval: float = 30.0,
+        peer_liveness_timeout: float = 180.0,
+        chain_config: ChainConfig | None = None,
     ) -> None:
-        self.chain = Chain(data_dir)
+        self.chain = Chain(data_dir) if chain_config is None else Chain(data_dir, config=chain_config)
         self.chain_lock = threading.RLock()
 
         self.data_dir = Path(data_dir)
@@ -231,19 +412,32 @@ class P2PNode:
             self.peer_auth_max_skew_seconds,
             int(peer_auth_replay_window_seconds),
         )
+        self.max_inv_items = max(16, int(max_inv_items))
+        self.max_getdata_items = max(8, int(max_getdata_items))
+        self.max_orphan_blocks = max(16, int(max_orphan_blocks))
+        self.orphan_ttl_seconds = max(60, int(orphan_ttl_seconds))
+        self.max_outbound_broadcast_peers = max(1, int(max_outbound_broadcast_peers))
+        self.max_outbound_sync_peers = max(1, int(max_outbound_sync_peers))
+        self.max_outbound_peers_per_bucket = max(1, int(max_outbound_peers_per_bucket))
+        self.peer_ping_interval = max(5.0, float(peer_ping_interval))
+        self.peer_liveness_timeout = max(self.peer_ping_interval, float(peer_liveness_timeout))
         self.stop_event = threading.Event()
         self._sync_thread: threading.Thread | None = None
         self._rate_limit_lock = threading.Lock()
         self._sync_retry_lock = threading.Lock()
         self._peer_security_lock = threading.RLock()
+        self._last_peer_probe_monotonic = 0.0
 
         adv_host = advertise_host.strip() if advertise_host else host
         self.node_url = normalize_peer(f"http://{adv_host}:{self.port}")
 
         self.peers_path = self.data_dir / "peers.json"
         self.peer_security_path = self.data_dir / "peer_security.json"
+        self.addrman_path = self.data_dir / "addrman.json"
         self.identity_path = self.data_dir / "node_identity.json"
         self._peers: set[str] = set()
+        self._bootnodes: list[str] = []
+        self._addrman: dict[str, dict[str, Any]] = {}
         self._identity_private_key = ""
         self._identity_public_key = ""
         self._identity_id = ""
@@ -252,6 +446,9 @@ class P2PNode:
         self._seen_tx_order: deque[str] = deque()
         self._seen_block_hashes: set[str] = set()
         self._seen_block_order: deque[str] = deque()
+        self._orphan_blocks: dict[str, Block] = {}
+        self._orphans_by_prev: dict[str, set[str]] = defaultdict(set)
+        self._orphan_received_at: dict[str, float] = {}
         self._client_hits: dict[str, deque[float]] = defaultdict(deque)
         self._sync_retry_last: dict[tuple[str, str], float] = {}
         self._peer_scores: dict[str, int] = {}
@@ -264,10 +461,28 @@ class P2PNode:
         self._load_or_create_identity()
         self._load_peers()
         self._load_peer_security()
+        self._load_addrman()
+
+        for bootnode in bootnodes or []:
+            try:
+                peer_url = normalize_peer(bootnode)
+            except ValueError:
+                continue
+            if peer_url == self.node_url or peer_url in self._bootnodes:
+                continue
+            self._bootnodes.append(peer_url)
+            self._touch_addrman_peer(peer_url, source="bootnode")
+            self.add_peer(peer_url, persist=False)
+
         for peer in peers or []:
             self.add_peer(peer, persist=False)
+            try:
+                self._touch_addrman_peer(normalize_peer(peer), source="manual")
+            except ValueError:
+                continue
         self._save_peers()
         self._save_peer_security()
+        self._save_addrman()
 
         with self.chain_lock:
             self._refresh_chain_from_disk_unlocked()
@@ -331,6 +546,10 @@ class P2PNode:
 
                     if path == "/health":
                         self._send_json(200, {"ok": True})
+                        return
+
+                    if path == "/ping":
+                        self._send_json(200, node.ping_payload())
                         return
 
                     if path in {"/status", "/api/v1/status"}:
@@ -420,6 +639,22 @@ class P2PNode:
                         self._send_json(200, node.history_payload(address=address, limit=limit))
                         return
 
+                    if path == "/api/v1/nfts":
+                        query = self._query()
+                        token_id = self._query_first(query, "token_id", "").strip()
+                        self._send_json(200, node.nft_state_payload(token_id=token_id or None))
+                        return
+
+                    if path == "/api/v1/nft/listings":
+                        self._send_json(200, node.nft_listings_payload())
+                        return
+
+                    if path == "/api/v1/contracts":
+                        query = self._query()
+                        contract_id = self._query_first(query, "contract_id", "").strip()
+                        self._send_json(200, node.contract_state_payload(contract_id=contract_id or None))
+                        return
+
                     self._send_json(404, {"ok": False, "error": "Not found"})
                 except ValidationError as exc:
                     self._send_json(400, {"ok": False, "error": str(exc)})
@@ -477,6 +712,21 @@ class P2PNode:
                         self._send_json(status, result)
                         return
 
+                    if path == "/inv":
+                        items = payload.get("items", [])
+                        ttl = node._coerce_ttl(payload.get("ttl", 2), field_name="ttl")
+                        sender = str(payload.get("from", "")).strip()
+                        result = node.accept_inventory(items, sender=sender, ttl=ttl)
+                        status = 200 if result.get("ok") else 400
+                        self._send_json(status, result)
+                        return
+
+                    if path == "/getdata":
+                        items = payload.get("items", [])
+                        ttl = node._coerce_ttl(payload.get("ttl", 2), field_name="ttl")
+                        self._send_json(200, node.getdata_payload(items, ttl=ttl))
+                        return
+
                     if path == "/sync":
                         peer = str(payload.get("peer", "")).strip()
                         if peer:
@@ -487,14 +737,19 @@ class P2PNode:
                         return
 
                     if path == "/api/v1/tx/create":
-                        private_key_hex = str(payload.get("private_key_hex", "")).strip()
+                        # Deprecated for security: private keys must never be sent to nodes.
+                        raise ValidationError(
+                            "Deprecated endpoint. Use /api/v1/tx/build + local offline signing + /api/v1/tx/submit"
+                        )
+
+                    if path == "/api/v1/tx/build":
+                        sender_pubkey = str(payload.get("sender_pubkey", "")).strip().lower()
                         to_address = str(payload.get("to_address", "")).strip()
                         amount_raw = payload.get("amount")
                         fee_raw = payload.get("fee", None)
-                        ttl_raw = payload.get("broadcast_ttl", 2)
 
-                        if not private_key_hex:
-                            raise ValidationError("Missing field: private_key_hex")
+                        if not sender_pubkey:
+                            raise ValidationError("Missing field: sender_pubkey")
                         if not to_address:
                             raise ValidationError("Missing field: to_address")
                         if amount_raw is None:
@@ -506,15 +761,70 @@ class P2PNode:
                         except (TypeError, ValueError) as exc:
                             raise ValidationError("amount and fee must be integers") from exc
 
-                        ttl = node._coerce_ttl(ttl_raw, field_name="broadcast_ttl")
-
-                        result = node.create_and_broadcast_transaction(
-                            private_key_hex=private_key_hex,
+                        result = node.build_unsigned_transaction(
+                            sender_pubkey=sender_pubkey,
                             to_address=to_address,
                             amount=amount,
                             fee=fee,
-                            broadcast_ttl=ttl,
                         )
+                        status = 200 if result.get("ok") else 400
+                        self._send_json(status, result)
+                        return
+
+                    if path == "/api/v1/tx/build-contract":
+                        sender_pubkey = str(payload.get("sender_pubkey", "")).strip().lower()
+                        contract_payload = payload.get("contract")
+                        fee_raw = payload.get("fee", None)
+                        to_address = payload.get("to_address", None)
+                        amount_raw = payload.get("amount", None)
+
+                        if not sender_pubkey:
+                            raise ValidationError("Missing field: sender_pubkey")
+                        if not isinstance(contract_payload, dict):
+                            raise ValidationError("Missing or invalid field: contract")
+
+                        fee: int | None
+                        amount: int | None
+                        try:
+                            fee = int(fee_raw) if fee_raw is not None else None
+                            amount = int(amount_raw) if amount_raw is not None else None
+                        except (TypeError, ValueError) as exc:
+                            raise ValidationError("fee and amount must be integers when provided") from exc
+
+                        with node.chain_lock:
+                            self._refresh_chain_from_disk_unlocked()
+                            tx = node.chain.create_unsigned_contract_transaction(
+                                sender_pubkey=sender_pubkey,
+                                contract_payload=contract_payload,
+                                fee=fee,
+                                to_address=str(to_address).strip() if to_address is not None else None,
+                                amount=amount,
+                            )
+                        self._send_json(
+                            200,
+                            {
+                                "ok": True,
+                                "tx": tx.to_dict(),
+                                "inputs": len(tx.inputs),
+                                "outputs": len(tx.outputs),
+                                "unsigned": True,
+                                "contract": True,
+                            },
+                        )
+                        return
+
+                    if path == "/api/v1/tx/submit":
+                        tx_raw = payload.get("tx")
+                        if not isinstance(tx_raw, dict):
+                            raise ValidationError("Missing field: tx")
+                        ttl_raw = payload.get("broadcast_ttl", 2)
+                        ttl = node._coerce_ttl(ttl_raw, field_name="broadcast_ttl")
+                        try:
+                            tx = Transaction.from_dict(tx_raw)
+                        except Exception as exc:
+                            raise ValidationError(f"Invalid transaction payload: {exc}") from exc
+
+                        result = node.submit_signed_transaction(tx=tx, broadcast_ttl=ttl)
                         status = 200 if result.get("ok") else 400
                         self._send_json(status, result)
                         return
@@ -678,12 +988,89 @@ class P2PNode:
             self._save_peer_security()
         return is_banned
 
-    def _get_relay_peers(self) -> list[str]:
+    @staticmethod
+    def _peer_diversity_bucket(peer_url: str) -> str:
+        parsed = urlparse(peer_url)
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            return "unknown"
+
+        try:
+            ip_obj = ipaddress.ip_address(host)
+        except ValueError:
+            labels = [label for label in host.split(".") if label]
+            if len(labels) >= 2:
+                return f"dns:{labels[-2]}.{labels[-1]}"
+            return f"dns:{host}"
+
+        if ip_obj.version == 4:
+            octets = host.split(".")
+            if len(octets) >= 2:
+                return f"ipv4:{octets[0]}.{octets[1]}"
+            return f"ipv4:{host}"
+
+        hextets = ip_obj.exploded.split(":")
+        return f"ipv6:{':'.join(hextets[:3])}"
+
+    def _peer_preference_key(self, peer_url: str) -> tuple[float, float, float, str]:
+        now = time.time()
+        with self._peer_security_lock:
+            score = float(int(self._peer_scores.get(peer_url, 0)))
+            addr = self._addrman.get(peer_url, {})
+            successes = float(max(0, int(addr.get("successes", 0))))
+            failures = float(max(0, int(addr.get("failures", 0))))
+            last_seen = float(max(0.0, float(addr.get("last_seen", 0.0))))
+            last_rtt = float(max(0.0, float(addr.get("last_rtt_ms", 0.0))))
+        stale_penalty = 2.0 if last_seen > 0 and (now - last_seen) > self.peer_liveness_timeout else 0.0
+        reliability_penalty = max(0.0, failures - successes)
+        rtt_penalty = min(3.0, last_rtt / 500.0) if last_rtt > 0 else 0.0
+        total_penalty = score + reliability_penalty + stale_penalty + rtt_penalty
+        return (total_penalty, -successes, -last_seen, peer_url)
+
+    def _select_diverse_peers(self, peers: list[str], limit: int) -> list[str]:
+        if limit <= 0 or not peers:
+            return []
+
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for peer in peers:
+            grouped[self._peer_diversity_bucket(peer)].append(peer)
+
+        for bucket in grouped.values():
+            bucket.sort(key=self._peer_preference_key)
+
+        buckets = sorted(grouped.keys())
+        selected: list[str] = []
+        picked_per_bucket: dict[str, int] = defaultdict(int)
+
+        while len(selected) < limit:
+            progressed = False
+            for bucket in buckets:
+                picked = picked_per_bucket[bucket]
+                if picked >= self.max_outbound_peers_per_bucket:
+                    continue
+                candidates = grouped[bucket]
+                if picked >= len(candidates):
+                    continue
+                selected.append(candidates[picked])
+                picked_per_bucket[bucket] += 1
+                progressed = True
+                if len(selected) >= limit:
+                    break
+            if not progressed:
+                break
+
+        return selected
+
+    def _get_relay_peers(self, limit: int | None = None) -> list[str]:
         peers: list[str] = []
         for peer in self.get_peers():
             if not self._is_peer_banned(peer):
                 peers.append(peer)
-        return peers
+        if not peers:
+            return []
+        wanted = self.max_outbound_broadcast_peers if limit is None else max(1, int(limit))
+        wanted = min(wanted, len(peers))
+        return self._select_diverse_peers(peers, limit=wanted)
 
     def _penalize_peer(self, peer_url: str, points: int, reason: str) -> None:
         if not peer_url or not self._is_known_peer(peer_url):
@@ -1026,10 +1413,142 @@ class P2PNode:
     def _prime_seen_from_chain_unlocked(self) -> None:
         for block in self.chain.chain:
             self._remember_block_hash(block.block_hash)
+            self._drop_orphan_unlocked(block.block_hash)
             for tx in block.transactions:
                 self._remember_txid(tx.txid)
         for tx in self.chain.mempool:
             self._remember_txid(tx.txid)
+        self._prune_orphans_unlocked()
+
+    @staticmethod
+    def _empty_addrman_entry(source: str = "") -> dict[str, Any]:
+        return {
+            "attempts": 0,
+            "successes": 0,
+            "failures": 0,
+            "last_seen": 0.0,
+            "last_success": 0.0,
+            "last_failure": 0.0,
+            "last_rtt_ms": 0.0,
+            "source": source.strip()[:40] if source else "",
+        }
+
+    def _touch_addrman_peer(self, peer_url: str, source: str = "", persist: bool = False) -> None:
+        if not peer_url or peer_url == self.node_url:
+            return
+        changed = False
+        with self._peer_security_lock:
+            entry = self._addrman.get(peer_url)
+            if entry is None:
+                self._addrman[peer_url] = self._empty_addrman_entry(source=source)
+                changed = True
+            elif source and not str(entry.get("source", "")).strip():
+                entry["source"] = source.strip()[:40]
+                changed = True
+        if changed and persist:
+            self._save_addrman()
+
+    def _record_peer_contact(
+        self,
+        peer_url: str,
+        *,
+        success: bool,
+        rtt_ms: float | None = None,
+        reason: str = "",
+        persist: bool = True,
+    ) -> None:
+        if not peer_url or peer_url == self.node_url:
+            return
+        now = time.time()
+        with self._peer_security_lock:
+            entry = self._addrman.get(peer_url)
+            if entry is None:
+                entry = self._empty_addrman_entry()
+                self._addrman[peer_url] = entry
+            entry["attempts"] = int(entry.get("attempts", 0)) + 1
+            entry["last_seen"] = float(now)
+            if rtt_ms is not None:
+                entry["last_rtt_ms"] = max(0.0, float(rtt_ms))
+            if success:
+                entry["successes"] = int(entry.get("successes", 0)) + 1
+                entry["last_success"] = float(now)
+            else:
+                entry["failures"] = int(entry.get("failures", 0)) + 1
+                entry["last_failure"] = float(now)
+            if reason.strip():
+                self._peer_last_reason[peer_url] = reason.strip()[:160]
+        if persist:
+            self._save_addrman()
+            if reason.strip():
+                self._save_peer_security()
+
+    def _save_addrman(self) -> None:
+        with self._peer_security_lock:
+            payload = {
+                "version": 1,
+                "updated_at": int(time.time()),
+                "entries": {peer: dict(entry) for peer, entry in self._addrman.items()},
+            }
+        temp_path = self.addrman_path.with_suffix(".json.tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, self.addrman_path)
+
+    def _load_addrman(self) -> None:
+        if not self.addrman_path.exists():
+            return
+        try:
+            with self.addrman_path.open("r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            if not isinstance(raw, dict):
+                return
+        except Exception:
+            return
+
+        entries_raw = raw.get("entries", {})
+        if not isinstance(entries_raw, dict):
+            return
+
+        loaded: dict[str, dict[str, Any]] = {}
+        for key, value in entries_raw.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                peer_url = normalize_peer(str(key))
+            except Exception:
+                continue
+            if peer_url == self.node_url:
+                continue
+            entry = self._empty_addrman_entry(source=str(value.get("source", "")))
+            try:
+                entry["attempts"] = max(0, int(value.get("attempts", 0)))
+                entry["successes"] = max(0, int(value.get("successes", 0)))
+                entry["failures"] = max(0, int(value.get("failures", 0)))
+                entry["last_seen"] = max(0.0, float(value.get("last_seen", 0.0)))
+                entry["last_success"] = max(0.0, float(value.get("last_success", 0.0)))
+                entry["last_failure"] = max(0.0, float(value.get("last_failure", 0.0)))
+                entry["last_rtt_ms"] = max(0.0, float(value.get("last_rtt_ms", 0.0)))
+            except Exception:
+                continue
+            loaded[peer_url] = entry
+
+        with self._peer_security_lock:
+            self._addrman.update(loaded)
+            # Rehydrate known peers from addrman to preserve network memory across restarts.
+            for peer_url in sorted(
+                loaded.keys(),
+                key=lambda peer: (
+                    -int(loaded[peer].get("successes", 0)),
+                    int(loaded[peer].get("failures", 0)),
+                    -float(loaded[peer].get("last_seen", 0.0)),
+                    peer,
+                ),
+            ):
+                if len(self._peers) >= self.max_peer_count:
+                    break
+                self._peers.add(peer_url)
 
     def _load_peers(self) -> None:
         if not self.peers_path.exists():
@@ -1075,26 +1594,78 @@ class P2PNode:
         with self._peer_security_lock:
             self._peer_scores.setdefault(peer_url, 0)
             self._peer_last_reason.setdefault(peer_url, "added")
+        self._touch_addrman_peer(peer_url, source="manual")
         learned_pubkey = self._fetch_peer_public_key(peer_url)
         if learned_pubkey:
             with self._peer_security_lock:
                 self._peer_pubkeys[peer_url] = learned_pubkey
                 self._peer_last_reason[peer_url] = "identity-verified"
+            self._record_peer_contact(peer_url, success=True, reason="identity-verified", persist=False)
+        else:
+            self._record_peer_contact(peer_url, success=False, reason="identity-fetch-failed", persist=False)
         if persist:
             self._save_peers()
             self._save_peer_security()
+            self._save_addrman()
         return True, "added-verified" if learned_pubkey else "added", peer_url
 
     def add_peer(self, peer: str, persist: bool = True) -> bool:
         added, _reason, _peer_url = self.add_peer_with_reason(peer, persist=persist)
         return added
 
-    def status_payload(self) -> dict[str, Any]:
+    def ping_payload(self) -> dict[str, Any]:
         with self.chain_lock:
             self._refresh_chain_from_disk_unlocked()
             status = self.chain.status()
+        return {
+            "ok": True,
+            "node": self.node_url,
+            "ts": int(time.time()),
+            "chain_id": str(status.get("chain_id", "")),
+            "height": int(status.get("height", -1)),
+            "tip_hash": status.get("tip_hash"),
+        }
+
+    def _addrman_payload(self) -> dict[str, Any]:
+        now = time.time()
+        with self._peer_security_lock:
+            rows: list[dict[str, Any]] = []
+            for peer in sorted(self._addrman.keys()):
+                entry = self._addrman.get(peer, {})
+                last_seen = float(entry.get("last_seen", 0.0))
+                rows.append(
+                    {
+                        "peer": peer,
+                        "source": str(entry.get("source", "")),
+                        "attempts": int(entry.get("attempts", 0)),
+                        "successes": int(entry.get("successes", 0)),
+                        "failures": int(entry.get("failures", 0)),
+                        "last_seen_seconds_ago": int(max(0.0, now - last_seen)) if last_seen > 0 else None,
+                        "last_rtt_ms": float(entry.get("last_rtt_ms", 0.0)),
+                    }
+                )
+        alive_recent = sum(
+            1
+            for row in rows
+            if isinstance(row.get("last_seen_seconds_ago"), int)
+            and int(row["last_seen_seconds_ago"]) <= int(self.peer_liveness_timeout)
+        )
+        return {
+            "entries": len(rows),
+            "alive_recent": alive_recent,
+            "bootnodes": list(self._bootnodes),
+            "rows": rows,
+        }
+
+    def status_payload(self) -> dict[str, Any]:
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            self._prune_orphans_unlocked()
+            status = self.chain.status()
             tip = self.chain.tip
             work = int(tip.chain_work) if tip else 0
+            orphan_count = len(self._orphan_blocks)
+            orphan_parent_count = len(self._orphans_by_prev)
         return {
             "ok": True,
             "node": self.node_url,
@@ -1114,10 +1685,28 @@ class P2PNode:
                 "peer_ban_seconds": self.peer_ban_seconds,
                 "peer_auth_max_skew_seconds": self.peer_auth_max_skew_seconds,
                 "peer_auth_replay_window_seconds": self.peer_auth_replay_window_seconds,
+                "max_inv_items": self.max_inv_items,
+                "max_getdata_items": self.max_getdata_items,
+                "max_orphan_blocks": self.max_orphan_blocks,
+                "orphan_ttl_seconds": self.orphan_ttl_seconds,
+                "max_outbound_broadcast_peers": self.max_outbound_broadcast_peers,
+                "max_outbound_sync_peers": self.max_outbound_sync_peers,
+                "max_outbound_peers_per_bucket": self.max_outbound_peers_per_bucket,
+                "peer_ping_interval": self.peer_ping_interval,
+                "peer_liveness_timeout": self.peer_liveness_timeout,
             },
             "peer_security": self._peer_security_payload(),
+            "addrman": self._addrman_payload(),
             "status": status,
             "chain_work": work,
+            "orphans": {
+                "count": orphan_count,
+                "parent_keys": orphan_parent_count,
+            },
+            "protocols": {
+                "inventory_relay": "inv/getdata",
+                "liveness": "ping/pong",
+            },
         }
 
     def balance_payload(self, address: str) -> dict[str, Any]:
@@ -1260,6 +1849,24 @@ class P2PNode:
 
         return {"ok": True, "address": address, "rows": rows[:limit], "limit": limit}
 
+    def nft_state_payload(self, token_id: str | None = None) -> dict[str, Any]:
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            data = self.chain.nft_state(token_id=token_id)
+        return {"ok": True, **data}
+
+    def nft_listings_payload(self) -> dict[str, Any]:
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            data = self.chain.nft_listings_state()
+        return {"ok": True, **data}
+
+    def contract_state_payload(self, contract_id: str | None = None) -> dict[str, Any]:
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            data = self.chain.smart_contract_state(contract_id=contract_id)
+        return {"ok": True, **data}
+
     def snapshot_meta_payload(self) -> dict[str, Any]:
         with self.chain_lock:
             self._refresh_chain_from_disk_unlocked()
@@ -1365,15 +1972,413 @@ class P2PNode:
         except ValueError:
             return ""
 
+    def _normalize_inventory_items(self, items_raw: Any, limit: int) -> list[dict[str, str]]:
+        if not isinstance(items_raw, list):
+            raise ValidationError("items must be a list")
+
+        normalized: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        max_items = max(1, int(limit))
+        for raw in items_raw:
+            if len(normalized) >= max_items:
+                break
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("type", "")).strip().lower()
+            object_id = str(raw.get("id", "")).strip().lower()
+            if kind not in {"tx", "block"}:
+                continue
+            if not self._is_hex_string(object_id, 64):
+                continue
+            key = (kind, object_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({"type": kind, "id": object_id})
+        return normalized
+
+    def _chain_has_block_hash_unlocked(self, block_hash: str) -> bool:
+        if not block_hash:
+            return False
+        if block_hash in self._orphan_blocks:
+            return True
+        return any(block.block_hash == block_hash for block in self.chain.chain)
+
+    def _has_txid_unlocked(self, txid: str) -> bool:
+        if txid in self._seen_txids:
+            return True
+        return any(tx.txid == txid for tx in self.chain.mempool)
+
+    def _drop_orphan_unlocked(self, block_hash: str) -> bool:
+        block = self._orphan_blocks.pop(block_hash, None)
+        self._orphan_received_at.pop(block_hash, None)
+        if block is None:
+            return False
+
+        siblings = self._orphans_by_prev.get(block.prev_hash)
+        if siblings is not None:
+            siblings.discard(block_hash)
+            if not siblings:
+                self._orphans_by_prev.pop(block.prev_hash, None)
+        return True
+
+    def _prune_orphans_unlocked(self) -> int:
+        removed = 0
+        now = time.time()
+        stale_before = now - float(self.orphan_ttl_seconds)
+
+        stale_hashes = [block_hash for block_hash, ts in self._orphan_received_at.items() if ts < stale_before]
+        for block_hash in stale_hashes:
+            if self._drop_orphan_unlocked(block_hash):
+                removed += 1
+
+        if len(self._orphan_blocks) > self.max_orphan_blocks:
+            overflow = len(self._orphan_blocks) - self.max_orphan_blocks
+            oldest = sorted(self._orphan_received_at.items(), key=lambda item: item[1])[:overflow]
+            for block_hash, _ts in oldest:
+                if self._drop_orphan_unlocked(block_hash):
+                    removed += 1
+
+        return removed
+
+    def _store_orphan_unlocked(self, block: Block) -> str:
+        if block.block_hash in self._orphan_blocks:
+            return "orphan-known"
+        if self._chain_has_block_hash_unlocked(block.block_hash):
+            return "known"
+
+        self._prune_orphans_unlocked()
+        if len(self._orphan_blocks) >= self.max_orphan_blocks:
+            oldest = sorted(self._orphan_received_at.items(), key=lambda item: item[1])[:1]
+            for block_hash, _ts in oldest:
+                self._drop_orphan_unlocked(block_hash)
+
+        self._orphan_blocks[block.block_hash] = Block.from_dict(block.to_dict())
+        self._orphan_received_at[block.block_hash] = time.time()
+        self._orphans_by_prev[block.prev_hash].add(block.block_hash)
+        return "orphan-stored"
+
+    def _collect_orphan_children_unlocked(self, parent_hash: str) -> list[Block]:
+        child_hashes = sorted(self._orphans_by_prev.get(parent_hash, set()))
+        if not child_hashes:
+            return []
+
+        children: list[Block] = []
+        for child_hash in child_hashes:
+            child_block = self._orphan_blocks.get(child_hash)
+            if child_block is not None:
+                children.append(child_block)
+            self._drop_orphan_unlocked(child_hash)
+
+        children.sort(key=lambda block: (block.index, block.block_hash))
+        return children
+
+    def _drain_orphans_after_parent(self, parent_hash: str, ttl: int) -> int:
+        accepted = 0
+        queue: deque[str] = deque([parent_hash])
+        seen: set[str] = set()
+        relay_ttl = max(0, self._coerce_ttl(ttl, field_name="ttl") - 1)
+
+        while queue:
+            current_parent = queue.popleft()
+            if current_parent in seen:
+                continue
+            seen.add(current_parent)
+
+            with self.chain_lock:
+                self._refresh_chain_from_disk_unlocked()
+                self._prune_orphans_unlocked()
+                children = self._collect_orphan_children_unlocked(current_parent)
+
+            for child in children:
+                result = self.accept_block(child, sender="", ttl=relay_ttl, auth=None)
+                if bool(result.get("accepted")):
+                    accepted += 1
+                    queue.append(child.block_hash)
+                elif str(result.get("reason", "")).startswith("orphan"):
+                    continue
+                else:
+                    with self.chain_lock:
+                        self._drop_orphan_unlocked(child.block_hash)
+
+        return accepted
+
+    def getdata_payload(self, items_raw: Any, ttl: int = 2) -> dict[str, Any]:
+        relay_ttl = self._coerce_ttl(ttl, field_name="ttl")
+        items = self._normalize_inventory_items(items_raw, limit=self.max_getdata_items)
+        if not items:
+            return {"ok": True, "rows": [], "missing": [], "count": 0}
+
+        rows: list[dict[str, Any]] = []
+        missing: list[dict[str, str]] = []
+
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            self._prune_orphans_unlocked()
+            mempool_by_id = {tx.txid: tx for tx in self.chain.mempool}
+            blocks_by_hash = {block.block_hash: block for block in self.chain.chain}
+            blocks_by_hash.update(self._orphan_blocks)
+
+            for item in items:
+                kind = item["type"]
+                object_id = item["id"]
+                if kind == "tx":
+                    tx = mempool_by_id.get(object_id)
+                    if tx is None:
+                        missing.append(item)
+                        continue
+                    rows.append({"type": "tx", "id": object_id, "tx": tx.to_dict()})
+                    continue
+
+                block = blocks_by_hash.get(object_id)
+                if block is None:
+                    missing.append(item)
+                    continue
+                rows.append({"type": "block", "id": object_id, "block": block.to_dict()})
+
+        for row in rows:
+            row["auth"] = self._build_sender_auth(
+                purpose=row["type"],
+                object_id=row["id"],
+                ttl=relay_ttl,
+            )
+
+        return {
+            "ok": True,
+            "rows": rows,
+            "missing": missing,
+            "count": len(rows),
+        }
+
+    def _request_inventory_objects(
+        self,
+        peer_url: str,
+        items: list[dict[str, str]],
+        ttl: int,
+    ) -> dict[str, Any]:
+        requested = self._normalize_inventory_items(items, limit=self.max_getdata_items)
+        if not requested:
+            return {
+                "requested": 0,
+                "fetched": 0,
+                "accepted_tx": 0,
+                "accepted_blocks": 0,
+                "missing": 0,
+            }
+
+        relay_ttl = self._coerce_ttl(ttl, field_name="ttl")
+        contains_block = any(item.get("type") == "block" for item in requested)
+        timeout = max(self.request_timeout, 8.0) if contains_block else self.request_timeout
+
+        try:
+            response = _request_json(
+                _join_url(peer_url, "/getdata"),
+                method="POST",
+                payload={
+                    "items": requested,
+                    "ttl": relay_ttl,
+                    "from": self.node_url,
+                },
+                timeout=timeout,
+            )
+        except Exception as exc:
+            self._penalize_peer(
+                peer_url,
+                max(1, self.peer_penalty_bad_sync // 2),
+                f"getdata-fetch-failed:{str(exc)[:80]}",
+            )
+            return {
+                "requested": len(requested),
+                "fetched": 0,
+                "accepted_tx": 0,
+                "accepted_blocks": 0,
+                "missing": len(requested),
+                "error": str(exc),
+            }
+
+        rows = response.get("rows")
+        if not isinstance(rows, list):
+            self._penalize_peer(peer_url, self.peer_penalty_bad_sync, "getdata-invalid-rows")
+            return {
+                "requested": len(requested),
+                "fetched": 0,
+                "accepted_tx": 0,
+                "accepted_blocks": 0,
+                "missing": len(requested),
+                "error": "invalid-getdata-response",
+            }
+
+        requested_set = {(item["type"], item["id"]) for item in requested}
+        fetched = 0
+        accepted_tx = 0
+        accepted_blocks = 0
+        returned_set: set[tuple[str, str]] = set()
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            kind = str(row.get("type", "")).strip().lower()
+            object_id = str(row.get("id", "")).strip().lower()
+            key = (kind, object_id)
+            if key not in requested_set or key in returned_set:
+                continue
+            returned_set.add(key)
+
+            auth = row.get("auth")
+            if not isinstance(auth, dict):
+                self._penalize_peer(peer_url, max(1, self.peer_penalty_bad_sync // 2), "getdata-missing-auth")
+                continue
+
+            if kind == "tx":
+                tx_raw = row.get("tx")
+                if not isinstance(tx_raw, dict):
+                    continue
+                try:
+                    tx = Transaction.from_dict(tx_raw)
+                except Exception:
+                    self._penalize_peer(peer_url, max(1, self.peer_penalty_bad_sync // 2), "getdata-invalid-tx")
+                    continue
+                if tx.txid != object_id:
+                    self._penalize_peer(peer_url, self.peer_penalty_invalid_tx, "getdata-txid-mismatch")
+                    continue
+                fetched += 1
+                result = self.accept_transaction(tx, sender=peer_url, ttl=relay_ttl, auth=auth)
+                if bool(result.get("accepted")):
+                    accepted_tx += 1
+                continue
+
+            if kind == "block":
+                block_raw = row.get("block")
+                if not isinstance(block_raw, dict):
+                    continue
+                try:
+                    block = Block.from_dict(block_raw)
+                except Exception:
+                    self._penalize_peer(peer_url, max(1, self.peer_penalty_bad_sync // 2), "getdata-invalid-block")
+                    continue
+                if block.block_hash != object_id:
+                    self._penalize_peer(peer_url, self.peer_penalty_invalid_block, "getdata-block-hash-mismatch")
+                    continue
+                fetched += 1
+                result = self.accept_block(block, sender=peer_url, ttl=relay_ttl, auth=auth)
+                if bool(result.get("accepted")):
+                    accepted_blocks += 1
+
+        missing_count = len(requested_set - returned_set)
+        return {
+            "requested": len(requested),
+            "fetched": fetched,
+            "accepted_tx": accepted_tx,
+            "accepted_blocks": accepted_blocks,
+            "missing": missing_count,
+        }
+
+    def accept_inventory(self, items_raw: Any, sender: str = "", ttl: int = 2) -> dict[str, Any]:
+        sender_url = self._normalize_sender(sender)
+        relay_ttl = self._coerce_ttl(ttl, field_name="ttl")
+
+        if sender_url:
+            if self._is_peer_banned(sender_url):
+                return {"ok": False, "accepted": False, "reason": "sender-banned", "requested": 0}
+            if not self._is_known_peer(sender_url):
+                return {"ok": False, "accepted": False, "reason": "sender-not-known", "requested": 0}
+
+        items = self._normalize_inventory_items(items_raw, limit=self.max_inv_items)
+        if not items:
+            return {"ok": True, "accepted": False, "reason": "empty-inventory", "requested": 0}
+
+        requested: list[dict[str, str]] = []
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            self._prune_orphans_unlocked()
+
+            for item in items:
+                kind = item["type"]
+                object_id = item["id"]
+                if kind == "tx":
+                    if self._has_txid_unlocked(object_id):
+                        continue
+                    requested.append(item)
+                    continue
+
+                if self._chain_has_block_hash_unlocked(object_id) or object_id in self._seen_block_hashes:
+                    continue
+                requested.append(item)
+
+        if not requested:
+            return {
+                "ok": True,
+                "accepted": True,
+                "reason": "inventory-known",
+                "requested": 0,
+            }
+
+        if not sender_url:
+            return {
+                "ok": True,
+                "accepted": False,
+                "reason": "inventory-sender-missing",
+                "requested": len(requested),
+            }
+
+        fetch = self._request_inventory_objects(sender_url, requested, relay_ttl)
+        return {
+            "ok": True,
+            "accepted": True,
+            "reason": "inventory-requested",
+            **fetch,
+        }
+
+    def _broadcast_inventory(
+        self,
+        items: list[dict[str, str]],
+        ttl: int,
+        exclude: set[str] | None = None,
+    ) -> list[str]:
+        relay_ttl = self._coerce_ttl(ttl, field_name="ttl")
+        if relay_ttl <= 0:
+            return []
+
+        normalized_items = self._normalize_inventory_items(items, limit=self.max_inv_items)
+        if not normalized_items:
+            return []
+
+        skip = set(exclude or set())
+        failed: list[str] = []
+        for peer in self._get_relay_peers(limit=self.max_outbound_broadcast_peers):
+            if peer in skip:
+                continue
+            try:
+                _request_json(
+                    _join_url(peer, "/inv"),
+                    method="POST",
+                    payload={
+                        "items": normalized_items,
+                        "ttl": relay_ttl,
+                        "from": self.node_url,
+                    },
+                    timeout=self.request_timeout,
+                )
+            except NetworkError:
+                failed.append(peer)
+        return failed
+
     def _broadcast_tx(self, tx: Transaction, ttl: int, exclude: set[str] | None = None) -> None:
         bounded_ttl = self._coerce_ttl(ttl, field_name="ttl")
         if bounded_ttl <= 0:
             return
         skip = set(exclude or set())
+        failed_peers = self._broadcast_inventory(
+            [{"type": "tx", "id": tx.txid}],
+            ttl=bounded_ttl,
+            exclude=skip,
+        )
+        if not failed_peers:
+            return
+
         auth = self._build_sender_auth(purpose="tx", object_id=tx.txid, ttl=bounded_ttl)
-        for peer in self._get_relay_peers():
-            if peer in skip:
-                continue
+        for peer in failed_peers:
             try:
                 _request_json(
                     _join_url(peer, "/tx"),
@@ -1394,10 +2399,16 @@ class P2PNode:
         if bounded_ttl <= 0:
             return
         skip = set(exclude or set())
+        failed_peers = self._broadcast_inventory(
+            [{"type": "block", "id": block.block_hash}],
+            ttl=bounded_ttl,
+            exclude=skip,
+        )
+        if not failed_peers:
+            return
+
         auth = self._build_sender_auth(purpose="block", object_id=block.block_hash, ttl=bounded_ttl)
-        for peer in self._get_relay_peers():
-            if peer in skip:
-                continue
+        for peer in failed_peers:
             try:
                 _request_json(
                     _join_url(peer, "/block"),
@@ -1420,21 +2431,70 @@ class P2PNode:
         amount: int,
         fee: int | None = None,
         broadcast_ttl: int = 2,
-    ) -> dict[str, Any]:
+        ) -> dict[str, Any]:
         if amount <= 0:
             raise ValidationError("amount must be positive")
         ttl = self._coerce_ttl(broadcast_ttl, field_name="broadcast_ttl")
+        try:
+            sender_pubkey = private_key_to_public_key(private_key_hex).hex()
+        except Exception as exc:
+            raise ValidationError(f"Invalid private key: {exc}") from exc
+
+        template = self.build_unsigned_transaction(
+            sender_pubkey=sender_pubkey,
+            to_address=to_address,
+            amount=amount,
+            fee=fee,
+        )
+        tx_raw = template.get("tx")
+        if not isinstance(tx_raw, dict):
+            raise ValidationError("Failed to build transaction template")
+        try:
+            unsigned_tx = Transaction.from_dict(tx_raw)
+            signed_tx = sign_transaction_offline(unsigned_tx, private_key_hex=private_key_hex)
+        except NetworkError as exc:
+            raise ValidationError(str(exc)) from exc
+        return self.submit_signed_transaction(tx=signed_tx, broadcast_ttl=ttl)
+
+    def build_unsigned_transaction(
+        self,
+        sender_pubkey: str,
+        to_address: str,
+        amount: int,
+        fee: int | None = None,
+    ) -> dict[str, Any]:
+        if amount <= 0:
+            raise ValidationError("amount must be positive")
 
         with self.chain_lock:
             self._refresh_chain_from_disk_unlocked()
             if not self.chain.chain:
                 raise ValidationError("Initialize the chain first")
-            tx = self.chain.create_transaction(
-                private_key_hex=private_key_hex,
+            tx = self.chain.create_unsigned_transaction(
+                sender_pubkey=sender_pubkey,
                 to_address=to_address,
                 amount=amount,
                 fee=fee,
             )
+
+        return {
+            "ok": True,
+            "tx": tx.to_dict(),
+            "inputs": len(tx.inputs),
+            "outputs": len(tx.outputs),
+            "unsigned": True,
+        }
+
+    def submit_signed_transaction(
+        self,
+        tx: Transaction,
+        broadcast_ttl: int = 2,
+    ) -> dict[str, Any]:
+        ttl = self._coerce_ttl(broadcast_ttl, field_name="broadcast_ttl")
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            if not self.chain.chain:
+                raise ValidationError("Initialize the chain first")
             self.chain.add_transaction(tx)
             self._remember_txid(tx.txid)
 
@@ -1602,8 +2662,10 @@ class P2PNode:
                     )
                 return {"ok": False, "accepted": False, "reason": auth_reason, "hash": block.block_hash}
 
+        orphan_pool_size = 0
         with self.chain_lock:
             self._refresh_chain_from_disk_unlocked()
+            self._prune_orphans_unlocked()
 
             if block.block_hash in self._seen_block_hashes:
                 known_result = {"ok": True, "accepted": True, "reason": "known", "hash": block.block_hash}
@@ -1613,9 +2675,22 @@ class P2PNode:
 
             if any(existing.block_hash == block.block_hash for existing in self.chain.chain):
                 self._remember_block_hash(block.block_hash)
+                self._drop_orphan_unlocked(block.block_hash)
                 if relay_ttl > 0:
                     self._broadcast_block(block, ttl=relay_ttl - 1, exclude={sender_url} if sender_url else set())
                 return {"ok": True, "accepted": True, "reason": "known", "hash": block.block_hash}
+
+            parent_on_main_chain = any(existing.block_hash == block.prev_hash for existing in self.chain.chain)
+            if block.index > 0 and not parent_on_main_chain:
+                orphan_reason = self._store_orphan_unlocked(block)
+                return {
+                    "ok": True,
+                    "accepted": False,
+                    "reason": orphan_reason,
+                    "hash": block.block_hash,
+                    "orphan": True,
+                    "orphan_pool_size": len(self._orphan_blocks),
+                }
 
             try:
                 if not self.chain.chain and block.index == 0:
@@ -1658,18 +2733,146 @@ class P2PNode:
                     self._penalize_peer(sender_url, self.peer_penalty_invalid_block, f"invalid-block:{err[:80]}")
                     return {"ok": False, "accepted": False, "reason": err, "hash": block.block_hash}
 
+            self._drop_orphan_unlocked(block.block_hash)
             self._remember_block_hash(block.block_hash)
             for tx in block.transactions:
                 self._remember_txid(tx.txid)
             self._reward_peer(sender_url)
+            orphan_pool_size = len(self._orphan_blocks)
 
         self._broadcast_block(block, ttl=relay_ttl - 1, exclude={sender_url} if sender_url else set())
-        return {"ok": True, "accepted": True, "reason": "accepted", "hash": block.block_hash}
+        adopted_orphans = self._drain_orphans_after_parent(block.block_hash, ttl=relay_ttl)
+        return {
+            "ok": True,
+            "accepted": True,
+            "reason": "accepted",
+            "hash": block.block_hash,
+            "adopted_orphans": adopted_orphans,
+            "orphan_pool_size": orphan_pool_size,
+        }
+
+    def _ping_peer(self, peer_url: str) -> tuple[bool, float | None, str]:
+        started = time.perf_counter()
+        try:
+            payload = _request_json(
+                _join_url(peer_url, "/ping"),
+                method="GET",
+                timeout=max(1.0, min(self.request_timeout, 3.0)),
+            )
+        except Exception as exc:
+            self._record_peer_contact(peer_url, success=False, reason=f"ping-failed:{str(exc)[:80]}", persist=False)
+            return False, None, f"ping-failed:{exc}"
+
+        rtt_ms = (time.perf_counter() - started) * 1000.0
+        if not isinstance(payload, dict):
+            self._record_peer_contact(
+                peer_url,
+                success=False,
+                rtt_ms=rtt_ms,
+                reason="ping-invalid-payload",
+                persist=False,
+            )
+            return False, rtt_ms, "ping-invalid-payload"
+
+        remote_chain_id = str(payload.get("chain_id", "")).strip()
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            local_chain_id = str(self.chain.status().get("chain_id", "")).strip()
+        if remote_chain_id and local_chain_id and remote_chain_id != local_chain_id:
+            self._record_peer_contact(
+                peer_url,
+                success=False,
+                rtt_ms=rtt_ms,
+                reason="ping-chain-id-mismatch",
+                persist=False,
+            )
+            return False, rtt_ms, "chain-id-mismatch"
+
+        self._record_peer_contact(peer_url, success=True, rtt_ms=rtt_ms, reason="ping-ok", persist=False)
+        return True, rtt_ms, "ok"
+
+    def _peer_sync_compatible(self, peer_url: str) -> tuple[bool, str]:
+        try:
+            payload = _request_json(
+                _join_url(peer_url, "/status"),
+                method="GET",
+                timeout=max(self.request_timeout, 5.0),
+            )
+        except Exception as exc:
+            self._record_peer_contact(
+                peer_url,
+                success=False,
+                reason=f"status-fetch-failed:{str(exc)[:80]}",
+                persist=False,
+            )
+            return False, f"status-fetch-failed:{exc}"
+
+        remote_status_raw = payload.get("status", payload)
+        if not isinstance(remote_status_raw, dict):
+            self._record_peer_contact(peer_url, success=False, reason="status-invalid-payload", persist=False)
+            return False, "status-invalid-payload"
+
+        with self.chain_lock:
+            self._refresh_chain_from_disk_unlocked()
+            local_status = self.chain.status()
+
+        local_chain_id = str(local_status.get("chain_id", "")).strip()
+        remote_chain_id = str(remote_status_raw.get("chain_id", "")).strip()
+        if remote_chain_id and local_chain_id and remote_chain_id != local_chain_id:
+            self._record_peer_contact(peer_url, success=False, reason="sync-chain-id-mismatch", persist=False)
+            return False, "chain-id-mismatch"
+
+        local_schedule = str(local_status.get("target_schedule", "")).strip().lower()
+        remote_schedule = str(remote_status_raw.get("target_schedule", "")).strip().lower()
+        if remote_schedule and local_schedule and remote_schedule != local_schedule:
+            self._record_peer_contact(
+                peer_url,
+                success=False,
+                reason="sync-target-schedule-mismatch",
+                persist=False,
+            )
+            return False, "target-schedule-mismatch"
+
+        local_genesis = str(local_status.get("fixed_genesis_hash", "")).strip().lower()
+        remote_genesis = str(remote_status_raw.get("fixed_genesis_hash", "")).strip().lower()
+        if remote_genesis and local_genesis and remote_genesis != local_genesis:
+            self._record_peer_contact(peer_url, success=False, reason="sync-genesis-mismatch", persist=False)
+            return False, "genesis-mismatch"
+
+        self._record_peer_contact(peer_url, success=True, reason="sync-compatible", persist=False)
+        return True, "ok"
+
+    def _probe_peers_liveness(self) -> None:
+        peers = self._get_relay_peers(limit=self.max_outbound_sync_peers)
+        for peer in peers:
+            ok, _rtt_ms, reason = self._ping_peer(peer)
+            if ok:
+                self._reward_peer(peer, points=1)
+                continue
+            if reason == "chain-id-mismatch":
+                self._penalize_peer(peer, self.peer_penalty_bad_sync, "ping-chain-id-mismatch")
+            else:
+                self._penalize_peer(peer, max(1, self.peer_penalty_bad_sync // 3), f"ping:{reason[:80]}")
+        if peers:
+            self._save_addrman()
 
     def _candidate_peer_metas(self) -> list[tuple[str, int, int]]:
         metas: list[tuple[str, int, int]] = []
-        for peer in self._get_relay_peers():
+        for peer in self._get_relay_peers(limit=self.max_outbound_sync_peers):
             try:
+                ping_ok, _rtt_ms, _ping_reason = self._ping_peer(peer)
+                if not ping_ok:
+                    continue
+
+                compatible, compatibility_reason = self._peer_sync_compatible(peer)
+                if not compatible:
+                    self._penalize_peer(
+                        peer,
+                        max(1, self.peer_penalty_bad_sync // 2),
+                        f"sync-incompatible:{compatibility_reason[:80]}",
+                    )
+                    continue
+
                 try:
                     meta = _request_json(_join_url(peer, "/headers/meta"), method="GET", timeout=self.request_timeout)
                 except Exception:
@@ -1677,8 +2880,11 @@ class P2PNode:
                 chain_work = int(meta.get("chain_work", 0))
                 height = int(meta.get("height", -1))
                 metas.append((peer, chain_work, height))
+                self._record_peer_contact(peer, success=True, reason="meta-ok", persist=False)
             except Exception:
+                self._record_peer_contact(peer, success=False, reason="meta-fetch-failed", persist=False)
                 continue
+        self._save_addrman()
         return metas
 
     def sync_from_best_peer(self) -> dict[str, Any]:
@@ -1738,6 +2944,19 @@ class P2PNode:
 
         if self._is_peer_banned(peer_url):
             return {"updated": False, "reason": "peer-banned", "peer": peer_url}
+
+        ping_ok, _rtt_ms, ping_reason = self._ping_peer(peer_url)
+        if not ping_ok:
+            return {"updated": False, "reason": f"peer-not-live:{ping_reason}", "peer": peer_url}
+
+        compatible, compatibility_reason = self._peer_sync_compatible(peer_url)
+        if not compatible:
+            self._penalize_peer(peer_url, self.peer_penalty_bad_sync, f"sync-incompatible:{compatibility_reason[:80]}")
+            return {
+                "updated": False,
+                "reason": f"incompatible-peer:{compatibility_reason}",
+                "peer": peer_url,
+            }
 
         try:
             header_result = self._sync_from_peer_headers(peer_url)
@@ -2013,6 +3232,10 @@ class P2PNode:
         # Keep node state close to the strongest known peer.
         while not self.stop_event.wait(self.sync_interval):
             try:
+                now = time.monotonic()
+                if now - self._last_peer_probe_monotonic >= self.peer_ping_interval:
+                    self._probe_peers_liveness()
+                    self._last_peer_probe_monotonic = now
                 self.sync_from_best_peer()
             except Exception:
                 continue
@@ -2041,3 +3264,7 @@ class P2PNode:
             pass
         if self._sync_thread is not None and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=2.0)
+        try:
+            self._save_addrman()
+        except Exception:
+            pass
